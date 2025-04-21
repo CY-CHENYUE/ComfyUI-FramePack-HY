@@ -1,0 +1,71 @@
+# Python相关文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 文档相关
+doc/
+docs/
+
+# 虚拟环境
+venv/
+ENV/
+.env
+.venv
+env/
+
+# IDE相关文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统相关文件
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+
+# 本地配置文件
+*.ini
+config.local.py
+
+# 模型文件和大文件 (根据需要取消注释)
+# *.pt
+# *.pth
+# *.ckpt
+# *.safetensors
+# *.onnx
+
+# 数据库文件
+*.db
+*.sqlite3
+
+# Jupyter Notebook
+.ipynb_checkpoints
