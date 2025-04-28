@@ -164,5 +164,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FramePackBucketResize_HY": "FramePack 分桶调整(HY)"
+    "FramePackBucketResize_HY": "FramePack BucketResize (HY)"
 } 
