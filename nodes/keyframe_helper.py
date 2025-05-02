@@ -6,311 +6,227 @@ from ..diffusers_helper.utils import repeat_to_batch_size
 
 class CreateKeyframes:
     """
-    辅助节点：创建和管理多个关键帧输入
-    
-    输入多个潜变量及其对应的帧位置，创建一个按顺序排列的关键帧集合
+    辅助节点：创建和管理视频首尾关键帧输入 (无级联)
+
+    输入首、尾两个潜变量，创建一个按顺序排列的关键帧集合，分别对应视频的第0段和最后一段。
+    此节点独立工作，不接受来自上游节点的级联关键帧。
     """
-    
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "first_keyframes": ("LATENT", {"tooltip": "第一个关键帧潜变量，通常是起始帧"}),
-                "video_length_seconds": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 60.0, "step": 0.1, 
-                                                  "tooltip": "视频总时长(秒)"}),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 60, "step": 1, 
-                               "tooltip": "视频帧率(每秒帧数)"}),
-                "window_size": ("INT", {"default": 9, "min": 4, "max": 33, "step": 1, 
-                                       "tooltip": "采样窗口大小参数，必须与sampler中的latent_window_size保持一致"}),
-                "first_frame": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, 
-                                       "tooltip": "第一个关键帧的帧位置，通常设为0表示视频开始"}),
+                "first_keyframes": ("LATENT", {"tooltip": "第一个关键帧潜变量，对应视频开头"}),
+                "video_length_seconds": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 60.0, "step": 0.1,
+                                                  "tooltip": "视频总时长(秒)，用于计算总分段数"}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 60, "step": 1,
+                               "tooltip": "视频帧率(每秒帧数)，用于计算总分段数"}),
+                "window_size": ("INT", {"default": 9, "min": 4, "max": 33, "step": 1,
+                                       "tooltip": "采样窗口大小参数，必须与sampler中的latent_window_size保持一致，用于计算总分段数"}),
+                # 移除了 first_frame 输入
             },
             "optional": {
-                # 其他关键帧设置
-                "second_keyframes": ("LATENT", {"tooltip": "第二个关键帧潜变量"}),
-                "second_frame": ("INT", {"default": 30, "min": 0, "max": 1000, "step": 1, 
-                                        "tooltip": "第二个关键帧的帧位置"}),
-                
-                "third_keyframes": ("LATENT", {"tooltip": "第三个关键帧潜变量"}),
-                "third_frame": ("INT", {"default": 60, "min": 0, "max": 1000, "step": 1, 
-                                       "tooltip": "第三个关键帧的帧位置"}),
-                
-                "fourth_keyframes": ("LATENT", {"tooltip": "第四个关键帧潜变量"}),
-                "fourth_frame": ("INT", {"default": 90, "min": 0, "max": 1000, "step": 1, 
-                                        "tooltip": "第四个关键帧的帧位置"}),
-                
-                # 之前的关键帧
-                "prev_keyframes": ("LATENT", {"tooltip": "之前创建的关键帧集合，用于级联更多关键帧"}),
-                "prev_keyframe_indices": ("KEYFRAME_INDICES", {"default": "", "tooltip": "之前关键帧的索引字符串，格式为逗号分隔的数字，例如'0,5,10'"}),
+                # 第二个关键帧设置 (对应视频结尾)
+                "second_keyframes": ("LATENT", {"tooltip": "第二个关键帧潜变量，对应视频结尾"}),
+                # 移除了 second_frame 输入
+                # 移除了第三、第四和之前的关键帧输入
             }
         }
-    
+
     RETURN_TYPES = ("LATENT", "KEYFRAME_INDICES", "video_length_seconds", "video_fps", "window_size",)
     RETURN_NAMES = ("keyframes", "keyframe_indices", "video_length_seconds", "fps", "window_size",)
     FUNCTION = "create_keyframes"
-    CATEGORY = "FramePack/辅助节点"
-    DESCRIPTION = """创建关键帧集合和对应的分段索引。
+    CATEGORY = "FramePack"
+    DESCRIPTION = """创建首尾关键帧集合和对应的分段索引 (无级联)。
 
-此节点允许您指定多个图像（潜变量）作为视频生成过程中的关键帧，并使用帧位置设置它们在视频中的位置。
-系统会自动将帧位置转换为分段索引用于视频生成。
+此节点接收代表视频开头和结尾的图像（潜变量）。
+它会自动将它们分配给视频的第0个分段和最后一个分段。
+此节点独立生成关键帧，不接受来自上游节点的级联输入。
 
 使用说明：
-1. 将多个图像通过VAE编码转换为潜变量，输入为first_keyframes, second_keyframes等
+1. 将1或2个图像通过VAE编码转换为潜变量，输入为first_keyframes（必需，开头）和second_keyframes（可选，结尾）
 2. 设置视频参数：总时长(秒)、帧率(fps)和窗口大小（与sampler中的latent_window_size保持一致）
-3. 为每个潜变量指定一个帧位置，表示它应该出现在视频中的位置
-4. 可以通过prev_keyframes和prev_keyframe_indices级联添加更多关键帧
 
 注意：
-- 第一个关键帧通常设置为帧位置0，表示视频开始
-- 帧位置的设置应考虑视频总时长和帧率，例如5秒24fps的视频总共有120帧
+- 第一个关键帧总是对应分段索引 0。
+- 如果提供了第二个关键帧，它总是对应最后一个分段索引。
 - 此节点的输出可以直接连接到FramePack Sampler (HY)节点的keyframes和keyframe_indices输入
 """
 
-    def frame_to_section_index(self, frame_position, fps, total_seconds, window_size):
-        """将帧位置转换为分段索引"""
-        # 计算每个窗口的有效帧数
-        frames_per_window = window_size * 4 - 3
-        
-        # 计算总帧数和总分段数
-        total_frames = total_seconds * fps
-        total_sections = math.ceil(total_frames / frames_per_window)
-        
-        # 显示计算信息，帮助用户理解
-        print(f"[CreateKeyframes] 总帧数: {total_frames}, 总分段数: {total_sections}")
-        print(f"[CreateKeyframes] 每个分段对应约 {frames_per_window} 帧")
-        
-        # 将帧位置映射到分段索引
-        if total_frames <= 0:
-            return 0
-        
-        # 计算归一化位置(0-1)，然后映射到分段索引
-        normalized_position = min(1.0, max(0.0, frame_position / total_frames))
-        section_index = int(normalized_position * (total_sections - 1) + 0.5)  # 四舍五入
-        
-        print(f"[CreateKeyframes] 帧位置 {frame_position} 映射到分段索引 {section_index}")
-        return section_index
-    
-    def create_keyframes(self, first_keyframes, video_length_seconds, fps, window_size, first_frame,
-                         second_keyframes=None, second_frame=30,
-                         third_keyframes=None, third_frame=60,
-                         fourth_keyframes=None, fourth_frame=90,
-                         prev_keyframes=None, prev_keyframe_indices=""):
-        """使用帧位置创建关键帧"""
+    # 移除了 frame_to_section_index 函数
+
+    def create_keyframes(self, first_keyframes, video_length_seconds, fps, window_size,
+                         second_keyframes=None):
+        # 移除了 first_frame, second_frame, prev_*, third_*, fourth_* 参数
+        """使用固定的首尾索引创建关键帧 (最多2个, 无级联)"""
         # 初始化关键帧列表和索引列表
         keyframes_list = []
         indices_list = []
-        
-        print(f"[CreateKeyframes] 开始处理关键帧输入，使用帧位置模式")
+
+        print(f"[CreateKeyframes] 开始处理首尾关键帧输入 (无级联)")
         print(f"[CreateKeyframes] 视频参数: 时长={video_length_seconds}秒, 帧率={fps}fps, 窗口大小={window_size}")
-        
-        # 转换帧位置为分段索引
-        first_index = self.frame_to_section_index(first_frame, fps, video_length_seconds, window_size)
-        print(f"[CreateKeyframes] 第一个关键帧: 帧位置 {first_frame} → 分段索引 {first_index}")
-        
-        # 转换其他关键帧的帧位置（如果存在）
+
+        # --- 计算总分段数 (之前在 frame_to_section_index 中) ---
+        frames_per_window = window_size * 4 - 3
+        total_frames = video_length_seconds * fps
+        if total_frames <= 0 or frames_per_window <= 0:
+             total_sections = 1 # 至少有1段
+        else:
+             total_sections = math.ceil(total_frames / frames_per_window)
+        total_sections = max(1, int(total_sections)) # 确保至少为1
+        print(f"[CreateKeyframes] 计算得到总帧数: {total_frames}, 总分段数: {total_sections}")
+        # -----------------------------------------------------
+
+        # 固定索引
+        first_index = 0
+        print(f"[CreateKeyframes] 第一个关键帧固定到分段索引: {first_index}")
+
         second_index = None
-        third_index = None
-        fourth_index = None
-        
         if second_keyframes is not None:
-            second_index = self.frame_to_section_index(second_frame, fps, video_length_seconds, window_size)
-            print(f"[CreateKeyframes] 第二个关键帧: 帧位置 {second_frame} → 分段索引 {second_index}")
-        
-        if third_keyframes is not None:
-            third_index = self.frame_to_section_index(third_frame, fps, video_length_seconds, window_size)
-            print(f"[CreateKeyframes] 第三个关键帧: 帧位置 {third_frame} → 分段索引 {third_index}")
-        
-        if fourth_keyframes is not None:
-            fourth_index = self.frame_to_section_index(fourth_frame, fps, video_length_seconds, window_size)
-            print(f"[CreateKeyframes] 第四个关键帧: 帧位置 {fourth_frame} → 分段索引 {fourth_index}")
-        
-        # 处理之前的关键帧
-        if prev_keyframes is not None and prev_keyframe_indices:
-            try:
-                # 提取之前的关键帧潜变量
-                prev_kf_samples = prev_keyframes["samples"]
-                print(f"[CreateKeyframes] 检测到prev_keyframes输入，形状: {prev_kf_samples.shape}")
-                
-                # 确保潜变量有正确的形状
-                if prev_kf_samples.ndim != 5:  # 必须是 [B, C, T, H, W]
-                    if prev_kf_samples.ndim == 4:  # 如果是 [B, C, H, W]
-                        prev_kf_samples = prev_kf_samples.unsqueeze(2)  # 添加时间维度
-                        print(f"[CreateKeyframes] 为prev_keyframes添加时间维度，新形状: {prev_kf_samples.shape}")
-                    else:
-                        print(f"[CreateKeyframes] 警告: prev_keyframes形状错误 {prev_kf_samples.shape}")
-                        prev_kf_samples = None
-                
-                # 解析之前的索引
-                prev_indices = [int(idx.strip()) for idx in prev_keyframe_indices.split(',') if idx.strip()]
-                print(f"[CreateKeyframes] 解析的prev_keyframe_indices: {prev_indices}")
-                
-                if prev_kf_samples is not None and len(prev_indices) > 0:
-                    # 检查维度匹配
-                    if prev_kf_samples.shape[2] == len(prev_indices):
-                        # 将之前的关键帧添加到列表
-                        keyframes_list.append(prev_kf_samples)
-                        indices_list.extend(prev_indices)
-                        print(f"[CreateKeyframes] 添加之前的{len(prev_indices)}个关键帧，索引: {prev_indices}")
-                    else:
-                        print(f"[CreateKeyframes] 警告: prev_keyframes帧数({prev_kf_samples.shape[2]})与prev_keyframe_indices长度({len(prev_indices)})不匹配")
-            except Exception as e:
-                print(f"[CreateKeyframes] 处理prev_keyframes时出错: {e}")
-        
-        # 处理新的关键帧
-        new_kfs = []
-        new_indices = []
-        
+            second_index = max(0, total_sections - 1) # 对应最后一个分段索引
+            print(f"[CreateKeyframes] 第二个关键帧固定到最后一个分段索引: {second_index}")
+            # 如果总共只有1段，那么 second_index 也会是 0
+            if first_index == second_index:
+                 print("[CreateKeyframes] 注意: 只有一个分段，首尾关键帧索引相同 ({first_index})。将只使用第一个关键帧。")
+                 # 设置 second_keyframes 为 None，避免后续处理和索引冲突
+                 second_keyframes = None
+                 second_index = None
+
+        # 处理关键帧 (最多2个)
+
         # 添加第一个关键帧（必需）
         first_kf_samples = first_keyframes["samples"]
-        print(f"[CreateKeyframes] 处理first_keyframes，形状: {first_kf_samples.shape}, 帧位置: {first_frame}, 分段索引: {first_index}")
-        
+        print(f"[CreateKeyframes] 处理第一个关键帧 (首帧)，形状: {first_kf_samples.shape}")
+
         # 确保是5D张量
         if first_kf_samples.ndim == 4:
             first_kf_samples = first_kf_samples.unsqueeze(2)
-            print(f"[CreateKeyframes] 为first_keyframes添加时间维度，新形状: {first_kf_samples.shape}")
+            print(f"[CreateKeyframes] 为第一个关键帧添加时间维度，新形状: {first_kf_samples.shape}")
         elif first_kf_samples.ndim != 5:
-            raise ValueError(f"关键帧形状错误: {first_kf_samples.shape}, 应为[B, C, H, W]或[B, C, T, H, W]")
-        
+            raise ValueError(f"第一个关键帧形状错误: {first_kf_samples.shape}, 应为[B, C, H, W]或[B, C, T, H, W]")
+
         # 如果是多帧潜变量，只取第一帧
         if first_kf_samples.shape[2] > 1:
             first_kf_samples = first_kf_samples[:, :, :1, :, :]
-            print(f"[CreateKeyframes] first_keyframes包含多帧，仅使用第一帧, 新形状: {first_kf_samples.shape}")
-            
-        new_kfs.append(first_kf_samples)
-        new_indices.append(first_index)
-        
-        # 添加可选的关键帧
-        optional_kfs = [
-            ("second_keyframes", second_keyframes, second_index, second_frame), 
-            ("third_keyframes", third_keyframes, third_index, third_frame), 
-            ("fourth_keyframes", fourth_keyframes, fourth_index, fourth_frame)
-        ]
-        
-        for name, kf, idx, frame in optional_kfs:
-            if kf is not None and idx is not None:
-                kf_samples = kf["samples"]
-                print(f"[CreateKeyframes] 处理{name}，形状: {kf_samples.shape}, 帧位置: {frame}, 分段索引: {idx}")
-                
-                # 确保是5D张量
-                if kf_samples.ndim == 4:
-                    kf_samples = kf_samples.unsqueeze(2)
-                    print(f"[CreateKeyframes] 为{name}添加时间维度，新形状: {kf_samples.shape}")
-                elif kf_samples.ndim != 5:
-                    print(f"[CreateKeyframes] 警告: {name}形状错误 {kf_samples.shape}, 跳过")
-                    continue
-                
-                # 如果是多帧潜变量，只取第一帧
+            print(f"[CreateKeyframes] 第一个关键帧包含多帧，仅使用第一帧, 新形状: {first_kf_samples.shape}")
+
+        keyframes_list.append(first_kf_samples)
+        indices_list.append(first_index)
+
+        # 添加第二个关键帧 (如果存在且有效)
+        if second_keyframes is not None and second_index is not None:
+            kf_samples = second_keyframes["samples"]
+            print(f"[CreateKeyframes] 处理第二个关键帧 (尾帧)，形状: {kf_samples.shape}, 索引: {second_index}")
+
+            # 确保是5D张量
+            if kf_samples.ndim == 4:
+                kf_samples = kf_samples.unsqueeze(2)
+                print(f"[CreateKeyframes] 为第二个关键帧添加时间维度，新形状: {kf_samples.shape}")
+            elif kf_samples.ndim != 5:
+                print(f"[CreateKeyframes] 警告: 第二个关键帧形状错误 {kf_samples.shape}, 跳过")
+                # 跳过，不添加
+            else:
+                 # 如果是多帧潜变量，只取第一帧
                 if kf_samples.shape[2] > 1:
                     kf_samples = kf_samples[:, :, :1, :, :]
-                    print(f"[CreateKeyframes] {name}包含多帧，仅使用第一帧, 新形状: {kf_samples.shape}")
-                
-                new_kfs.append(kf_samples)
-                new_indices.append(idx)
-                print(f"[CreateKeyframes] 成功添加{name}，帧位置: {frame}, 分段索引: {idx}")
-            elif kf is not None:
-                print(f"[CreateKeyframes] {name}存在，但索引计算错误，跳过")
-            else:
-                print(f"[CreateKeyframes] {name}为None，跳过")
-        
-        # 如果没有添加新的关键帧，直接返回之前的关键帧
-        if not new_kfs and keyframes_list:
-            # 合并所有之前的索引为字符串
-            indices_str = ",".join(map(str, indices_list))
-            print(f"[CreateKeyframes] 没有新关键帧，返回之前的{len(indices_list)}个关键帧")
-            
-            # 将视频参数直接作为返回值
-            result = prev_keyframes.copy() if isinstance(prev_keyframes, dict) else {"samples": prev_keyframes["samples"].clone()}
-            # 返回关键帧、索引和视频参数
-            return result, indices_str, video_length_seconds, fps, window_size
-        elif not new_kfs and not keyframes_list:
+                    print(f"[CreateKeyframes] 第二个关键帧包含多帧，仅使用第一帧, 新形状: {kf_samples.shape}")
+
+                keyframes_list.append(kf_samples)
+                indices_list.append(second_index)
+                print(f"[CreateKeyframes] 成功添加第二个关键帧 (尾帧)，索引: {second_index}")
+
+        elif second_keyframes is not None:
+             # 这种情况理论上不应该发生，因为我们在上面处理了索引冲突
+             print(f"[CreateKeyframes] 第二个关键帧存在，但索引无效，跳过")
+        else:
+             print(f"[CreateKeyframes] 未提供第二个关键帧 (尾帧)")
+
+        # 检查是否至少有一个有效的关键帧 (理论上总有第一个)
+        if not keyframes_list:
             print("[CreateKeyframes] 警告: 没有有效的关键帧输入")
             empty_latent = torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
             result = {"samples": empty_latent}
             # 返回关键帧、索引和视频参数
             return result, "", video_length_seconds, fps, window_size
-        
-        # 将所有新关键帧添加到列表
-        keyframes_list.extend(new_kfs)
-        indices_list.extend(new_indices)
-        
+
         print(f"[CreateKeyframes] 总共有{len(indices_list)}个关键帧待处理，索引列表: {indices_list}")
-        
-        # 按索引排序
-        if indices_list:
-            # 创建索引-关键帧对列表，并按索引排序
-            pairs = sorted(zip(indices_list, range(len(keyframes_list))), key=lambda x: x[0])
-            sorted_indices = [p[0] for p in pairs]
-            sorted_kf_indices = [p[1] for p in pairs]
-            
-            # 按排序后的顺序重新排列关键帧
-            sorted_keyframes = []
-            for idx in sorted_kf_indices:
-                sorted_keyframes.append(keyframes_list[idx])
-            
-            # 打印排序信息
-            print(f"[CreateKeyframes] 关键帧已排序，索引: {sorted_indices}")
-            
-            # 合并所有排序后的关键帧
-            device = sorted_keyframes[0].device
-            dtype = sorted_keyframes[0].dtype
-            
-            # 确保所有关键帧尺寸一致
-            height = sorted_keyframes[0].shape[3]
-            width = sorted_keyframes[0].shape[4]
-            channels = sorted_keyframes[0].shape[1]
-            batch_size = sorted_keyframes[0].shape[0]
-            
-            print(f"[CreateKeyframes] 基准尺寸: {batch_size}x{channels}x{height}x{width}, 设备: {device}, 类型: {dtype}")
-            
-            # 调整大小并组合
-            combined_samples = []
-            for i, kf in enumerate(sorted_keyframes):
-                print(f"[CreateKeyframes] 处理第{i+1}个关键帧 (索引 {sorted_indices[i]}), 形状: {kf.shape}")
-                current_height = kf.shape[3]
-                current_width = kf.shape[4]
-                
-                # 如果尺寸不匹配，调整大小
-                if current_height != height or current_width != width:
-                    print(f"[CreateKeyframes] 调整关键帧大小从 {current_height}x{current_width} 到 {height}x{width}")
-                    # 展平并调整尺寸
-                    b, c, t = kf.shape[0], kf.shape[1], kf.shape[2]
-                    flat = kf.reshape(b*c*t, 1, current_height, current_width)
-                    resized = torch.nn.functional.interpolate(
-                        flat, size=(height, width), mode='bilinear', align_corners=False
-                    )
-                    kf = resized.reshape(b, c, t, height, width)
-                
-                # 确保批次大小一致
-                if kf.shape[0] != batch_size:
-                    print(f"[CreateKeyframes] 调整批次大小从 {kf.shape[0]} 到 {batch_size}")
-                    kf = repeat_to_batch_size(kf, batch_size)
-                
-                combined_samples.append(kf)
-            
-            # 沿时间维度拼接
-            combined_latent = torch.cat(combined_samples, dim=2).to(device=device, dtype=dtype)
-            
-            # 解决顺序问题：在返回前逆转关键帧顺序，但保持索引值不变
-            # 沿时间维度 (dim=2) 逆转关键帧顺序
-            combined_latent = torch.flip(combined_latent, dims=[2])
-            print(f"[CreateKeyframes] 已逆转关键帧顺序，但保持原始索引值不变: {sorted_indices}")
-            
-            # 转换索引为字符串
-            indices_str = ",".join(map(str, sorted_indices))
-            
-            print(f"[CreateKeyframes] 成功创建{len(sorted_indices)}个关键帧, 形状: {combined_latent.shape}, 索引字符串: {indices_str}")
-            
-            # 在最终返回前更新结果
-            result = {"samples": combined_latent}
-            # 返回关键帧、索引和视频参数
-            return result, indices_str, video_length_seconds, fps, window_size
-        else:
-            # 没有关键帧时返回空结果
-            print("[CreateKeyframes] 警告: 没有有效的关键帧")
+
+        # 按索引排序 (现在只有 0 或 [0, N-1])
+        pairs = sorted(zip(indices_list, range(len(keyframes_list))), key=lambda x: x[0])
+        sorted_indices = [p[0] for p in pairs]
+        sorted_kf_indices = [p[1] for p in pairs]
+
+        # 按排序后的顺序重新排列关键帧
+        sorted_keyframes = []
+        for idx in sorted_kf_indices:
+            sorted_keyframes.append(keyframes_list[idx])
+
+        # 打印排序信息
+        print(f"[CreateKeyframes] 关键帧已排序，索引: {sorted_indices}")
+
+        # 合并所有排序后的关键帧
+        if not sorted_keyframes:
+             print("[CreateKeyframes] 警告: 排序后关键帧列表为空")
+             empty_latent = torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
+             return {"samples": empty_latent}, "", video_length_seconds, fps, window_size
+
+        device = sorted_keyframes[0].device
+        dtype = sorted_keyframes[0].dtype
+
+        # 确保所有关键帧尺寸一致
+        height = sorted_keyframes[0].shape[3]
+        width = sorted_keyframes[0].shape[4]
+        channels = sorted_keyframes[0].shape[1]
+        batch_size = sorted_keyframes[0].shape[0]
+
+        print(f"[CreateKeyframes] 基准尺寸: {batch_size}x{channels}x{height}x{width}, 设备: {device}, 类型: {dtype}")
+
+        # 调整大小并组合
+        combined_samples = []
+        for i, kf in enumerate(sorted_keyframes):
+            print(f"[CreateKeyframes] 处理第{i+1}个关键帧 (索引 {sorted_indices[i]}), 形状: {kf.shape}")
+            current_height = kf.shape[3]
+            current_width = kf.shape[4]
+
+            # 如果尺寸不匹配，调整大小
+            if current_height != height or current_width != width:
+                print(f"[CreateKeyframes] 调整关键帧大小从 {current_height}x{current_width} 到 {height}x{width}")
+                # 展平并调整尺寸
+                b, c, t = kf.shape[0], kf.shape[1], kf.shape[2]
+                flat = kf.reshape(b*c*t, 1, current_height, current_width)
+                resized = torch.nn.functional.interpolate(
+                    flat, size=(height, width), mode='bilinear', align_corners=False
+                )
+                kf = resized.reshape(b, c, t, height, width)
+
+            # 确保批次大小一致
+            if kf.shape[0] != batch_size:
+                print(f"[CreateKeyframes] 调整批次大小从 {kf.shape[0]} 到 {batch_size}")
+                kf = repeat_to_batch_size(kf, batch_size)
+
+            combined_samples.append(kf)
+
+        # 沿时间维度拼接
+        if not combined_samples:
+            print("[CreateKeyframes] 警告: 调整大小和组合后列表为空")
             empty_latent = torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
-            result = {"samples": empty_latent}
-            # 返回关键帧、索引和视频参数
-            return result, "", video_length_seconds, fps, window_size
+            return {"samples": empty_latent}, "", video_length_seconds, fps, window_size
+
+        combined_latent = torch.cat(combined_samples, dim=2).to(device=device, dtype=dtype)
+
+        # 沿时间维度 (dim=2) 逆转关键帧顺序以匹配Sampler的反向累积
+        combined_latent = torch.flip(combined_latent, dims=[2]) # 注释掉以保持原始顺序
+        print(f"[CreateKeyframes] 已翻转关键帧顺序以适应Sampler: {sorted_indices}") # 不再翻转，注释掉此打印
+
+        # 转换索引为字符串
+        indices_str = ",".join(map(str, sorted_indices))
+
+        print(f"[CreateKeyframes] 成功创建{len(sorted_indices)}个关键帧, 形状: {combined_latent.shape}, 索引字符串: {indices_str}")
+
+        # 在最终返回前更新结果
+        result = {"samples": combined_latent}
+        # 返回关键帧、索引和视频参数
+        return result, indices_str, video_length_seconds, fps, window_size
 
 
 NODE_CLASS_MAPPINGS = {
