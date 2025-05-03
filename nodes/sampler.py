@@ -521,15 +521,20 @@ class FramePackDiffusersSampler:
                 
                 # 如果是最后一段，连接视觉终点潜变量 (保持修正后的逻辑)
                 if is_last_section:
-                    print("[FramePack Sampler] 处理最后分段 (时间上的第一段)，准备拼接视觉终点帧...")
-                    if visual_end_latent is not None: 
-                        concat_frame = visual_end_latent.to(dtype=generated_latents.dtype, device=generated_latents.device)
-                        generated_latents = torch.cat([concat_frame, generated_latents], dim=2)
-                        print(f"[FramePack Sampler] 成功拼接视觉终点帧 (来自索引0), 新形状: {generated_latents.shape}")
-                    else:
-                        print("[FramePack Sampler] 关键帧信息不足，拼接默认零潜变量")
-                        default_first = torch.zeros_like(generated_latents[:, :, :1, :, :])
-                        generated_latents = torch.cat([default_first, generated_latents], dim=2)
+                    # 移除静态帧添加逻辑，防止视频开头出现静态画面
+                    print("[FramePack Sampler] 处理最后分段 (时间上的第一段)")
+                    # 不再额外添加静态帧，保持动态效果
+                    print(f"[FramePack Sampler] 保持动态开始，形状: {generated_latents.shape}")
+                    
+                    # 以下代码会导致视频开头出现静态帧，现已移除
+                    # if visual_end_latent is not None: 
+                    #     concat_frame = visual_end_latent.to(dtype=generated_latents.dtype, device=generated_latents.device)
+                    #     generated_latents = torch.cat([concat_frame, generated_latents], dim=2)
+                    #     print(f"[FramePack Sampler] 成功拼接视觉终点帧 (来自索引0), 新形状: {generated_latents.shape}")
+                    # else:
+                    #     print("[FramePack Sampler] 关键帧信息不足，拼接默认零潜变量")
+                    #     default_first = torch.zeros_like(generated_latents[:, :, :1, :, :])
+                    #     generated_latents = torch.cat([default_first, generated_latents], dim=2)
                 
                 # 更新总帧数和历史潜变量
                 total_generated_latent_frames += int(generated_latents.shape[2])
