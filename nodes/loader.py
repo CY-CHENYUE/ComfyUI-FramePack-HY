@@ -47,48 +47,25 @@ class LoadFramePackDiffusersPipeline:
             print("[FramePack Loader] 自动检测到fp16模型，设置dtype为float16")
             torch_dtype = torch.float16
 
-        # 更直接的路径处理，提供更详细的调试信息
+        # 模型路径查找
         model_found = False
-        
-        # 输出ComfyUI的models_dir信息，帮助调试
-        print("[FramePack Loader] 调试信息:")
         base_models_dir = getattr(folder_paths, 'models_dir', None)
-        if base_models_dir:
-            print(f"[FramePack Loader] ComfyUI models_dir: {base_models_dir}")
-        else:
-            print("[FramePack Loader] 警告: 无法获取ComfyUI models_dir")
-            
-        # 输出folder_paths信息
-        print(f"[FramePack Loader] ComfyUI folder_paths信息:")
-        for key in dir(folder_paths):
-            if not key.startswith('_') and key not in ['os', 'sys', 'time', 're', 'glob']:
-                try:
-                    value = getattr(folder_paths, key)
-                    if not callable(value):
-                        print(f"  - {key}: {value}")
-                except:
-                    pass
         
         # 1. 直接检查绝对路径
         if os.path.isdir(model_path):
-            print(f"[FramePack Loader] 使用绝对路径: {model_path}")
             model_found = True
             
         # 2. 尝试get_folder_paths方法
         if not model_found:
             try:
-                # 尝试不同的方法获取路径
                 if hasattr(folder_paths, 'get_folder_paths'):
                     diffusers_folders = folder_paths.get_folder_paths("diffusers")
-                    print(f"[FramePack Loader] ComfyUI diffusers文件夹: {diffusers_folders}")
                     
                     # 在所有diffusers文件夹中查找
                     for folder in diffusers_folders:
                         full_path = os.path.join(folder, model_path)
-                        print(f"[FramePack Loader] 检查路径: {full_path}")
                         if os.path.isdir(full_path):
                             model_path = full_path
-                            print(f"[FramePack Loader] 在diffusers文件夹找到模型: {model_path}")
                             model_found = True
                             break
             except Exception as e:
@@ -98,30 +75,24 @@ class LoadFramePackDiffusersPipeline:
         if not model_found and base_models_dir:
             # 处理形如 "lllyasviel/FramePackI2V_HY" 的路径
             standard_path = os.path.join(base_models_dir, "diffusers", model_path)
-            print(f"[FramePack Loader] 检查标准路径: {standard_path}")
             if os.path.isdir(standard_path):
                 model_path = standard_path
-                print(f"[FramePack Loader] 找到模型: {model_path}")
                 model_found = True
                 
             # 如果是斜杠分隔的路径，尝试按层级构建
             elif "/" in model_path:
                 parts = model_path.split("/")
                 constructed_path = os.path.join(base_models_dir, "diffusers", *parts)
-                print(f"[FramePack Loader] 检查构造路径: {constructed_path}")
                 if os.path.isdir(constructed_path):
                     model_path = constructed_path
-                    print(f"[FramePack Loader] 找到模型: {model_path}")
                     model_found = True
                     
                 # 仅使用最后一部分
                 else:
                     last_part = parts[-1]
                     simple_path = os.path.join(base_models_dir, "diffusers", last_part)
-                    print(f"[FramePack Loader] 检查简化路径: {simple_path}")
                     if os.path.isdir(simple_path):
                         model_path = simple_path
-                        print(f"[FramePack Loader] 找到模型: {model_path}")
                         model_found = True
         
         # 4. 尝试手动构建一些常见路径
@@ -142,20 +113,16 @@ class LoadFramePackDiffusersPipeline:
                     ])
             
             for path in common_paths:
-                print(f"[FramePack Loader] 检查常见路径: {path}")
                 if os.path.isdir(path):
                     model_path = path
-                    print(f"[FramePack Loader] 在常见路径找到模型: {model_path}")
                     model_found = True
                     break
             
             # 在当前目录下查找
             if not model_found:
                 cwd = os.getcwd()
-                print(f"[FramePack Loader] 当前工作目录: {cwd}")
                 for root, dirs, files in os.walk(os.path.join(cwd, "models")):
                     if os.path.basename(root) == "FramePackI2V_HY":
-                        print(f"[FramePack Loader] 在工作目录查找到模型: {root}")
                         model_path = root
                         model_found = True
                         break
@@ -176,7 +143,6 @@ class LoadFramePackDiffusersPipeline:
         # 检查目录内容是否符合预期
         try:
             dir_contents = os.listdir(model_path)
-            print(f"[FramePack Loader] 模型目录内容: {dir_contents}")
             # 检查是否包含必要的模型文件
             expected_files = ["config.json", "model.safetensors"]
             for file in expected_files:
