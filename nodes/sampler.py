@@ -66,6 +66,9 @@ class FramePackDiffusersSampler:
                 "sampler": (["unipc"],
                             {"default": "unipc", 
                              "tooltip": "采样器类型，目前仅支持unipc"}),
+                "start_latent_out": ("LATENT", {"tooltip": "来自Keyframe节点的起始潜变量"}),
+                "target_latent_out": ("LATENT", {"tooltip": "(可选) 来自Keyframe节点的目标潜变量"}),
+                "target_index_out": ("INT", {"tooltip": "(可选) 目标潜变量生效的分段索引"}),
             },
             "optional": {
                 # 从CreateKeyframes节点直接连接的视频参数
@@ -85,8 +88,6 @@ class FramePackDiffusersSampler:
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, 
                                                "tooltip": "I2V模式的去噪强度(当前未使用，未来可能用于start_latent)"}),
                 # 关键帧相关参数
-                "keyframes": ("LATENT", {"tooltip": "用于引导视频内容的关键帧潜变量集合 (预期为[视觉终点帧, 视觉起点帧])"}),
-                "keyframe_indices": ("KEYFRAME_INDICES", {"tooltip": "与keyframes对应的分段索引列表（必须升序，例如: '0,N-1'）。N为总分段数"}),
                 "keyframe_guidance_strength": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 10.0, "step": 0.1, 
                                                          "tooltip": "关键帧引导强度。控制关键帧对视频的影响程度。值越高，视频在关键帧位置越接近目标图像，过渡效果越明显"})
             }
@@ -101,7 +102,8 @@ class FramePackDiffusersSampler:
                total_second_length=5, fps=24, latent_window_size=9,
                video_length_seconds=None, video_fps=None, window_size=None,
                clip_vision=None, shift=0.0, use_teacache=True, 
-               teacache_thresh=0.15, denoise_strength=1.0, keyframes=None, keyframe_indices="", 
+               teacache_thresh=0.15, denoise_strength=1.0, 
+               start_latent_out=None, target_latent_out=None, target_index_out=-1,
                keyframe_guidance_strength=1.5):
 
         # 优先使用从CreateKeyframes节点连接的视频参数
@@ -181,12 +183,13 @@ class FramePackDiffusersSampler:
         batch_size = 1
         initial_latent = None # 当前逻辑不使用I2V的 initial_latent
         
-        # 初始化历史潜变量
+        # 初始化历史潜变量 - 修改：初始化为空，将在循环中构建
         history_latents = torch.zeros(
-            (batch_size, 16, 1 + 2 + 16, latent_height, latent_width),
-            dtype=torch.float32, 
-            device="cpu"
+            (batch_size, 16, 0, latent_height, latent_width), # 时间维度从0开始
+            dtype=torch.float32,
+            device="cpu" # 存储在CPU以节省显存
         )
+        total_generated_latent_frames = 0 # 追踪已生成的帧数
         
         # 准备随机生成器
         generator = torch.Generator("cpu").manual_seed(seed)
@@ -283,171 +286,210 @@ class FramePackDiffusersSampler:
         print(f"  - 种子: {seed}, 移位: {shift}")
         
         try:
-            # 处理分段生成
-            total_generated_latent_frames = 0
-            latent_paddings_list = list(reversed(range(total_latent_sections)))
-            latent_paddings = latent_paddings_list.copy()
-            
-            # 对于长视频，优化分段策略
-            if total_latent_sections > 4:
-                latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
-                latent_paddings_list = latent_paddings.copy()
-            
-            # 处理关键帧索引
-            keyframe_idx_list = []
-            if keyframes is not None and keyframe_indices:
-                try:
-                    # 解析索引字符串，格式如 "0,5,10"
-                    keyframe_idx_list = [int(idx.strip()) for idx in keyframe_indices.split(',') if idx.strip()]
-                    
-                    # 验证索引是否有效
-                    if not keyframe_idx_list:
-                        print("[FramePack Sampler] 警告: 提供了keyframes但keyframe_indices为空，关键帧功能将被禁用")
-                    else:
-                        # 检查索引是否为升序
-                        if sorted(keyframe_idx_list) != keyframe_idx_list:
-                            print("[FramePack Sampler] 警告: keyframe_indices不是升序，自动排序")
-                            keyframe_idx_list = sorted(keyframe_idx_list)
-                        
-                        # 检查关键帧数量是否与索引匹配
-                        if keyframes is not None and "samples" in keyframes:
-                            kf_samples = keyframes["samples"]
-                            if kf_samples.ndim == 5:  # [B, C, T, H, W]
-                                num_keyframes = kf_samples.shape[2]
-                                if num_keyframes != len(keyframe_idx_list):
-                                    print(f"[FramePack Sampler] 警告: keyframe_indices长度({len(keyframe_idx_list)})与keyframes数量({num_keyframes})不匹配")
-                                    if num_keyframes < len(keyframe_idx_list):
-                                        # 截断索引列表以匹配关键帧数量
-                                        keyframe_idx_list = keyframe_idx_list[:num_keyframes]
-                                        print(f"[FramePack Sampler] 索引列表已截断为: {keyframe_idx_list}")
-                            else:
-                                print(f"[FramePack Sampler] 警告: keyframes维度不正确: {kf_samples.shape}, 预期为[B, C, T, H, W]")
-                        
-                        print(f"[FramePack Sampler] 使用关键帧索引: {keyframe_idx_list}, 引导强度: {keyframe_guidance_strength}")
-                except Exception as e:
-                    print(f"[FramePack Sampler] 解析keyframe_indices出错: {e}")
-                    print(f"[FramePack Sampler] 请确保格式正确，例如: '0,5,10'")
-                    keyframe_idx_list = []  # 重置为空列表
-            
-            visual_end_latent = None # 在循环外初始化
+            # --- 修改: 处理新的 Start-Target 输入 --- 
             visual_start_latent = None
-            idx_visual_end = -1
-            idx_visual_start = -1
+            visual_target_latent = None
+            target_start_index = target_index_out # 直接使用传入的索引
+            # === 添加调试打印 ===
+            print(f"[FramePack Sampler DEBUG] Received target_index_out: {target_index_out}, Initial target_start_index: {target_start_index}")
+            # ==================
             
-            # 在循环开始前准备好关键帧潜变量 (如果可用)
-            if keyframes is not None and len(keyframe_idx_list) >= 1: # 修改: >= 1 即可处理
-                kf_samples = keyframes["samples"] * vae_scaling_factor
-                kf_samples = kf_samples.to(dtype=dtype, device="cpu")
-                if kf_samples.ndim == 5:
-                    if kf_samples.shape[2] >= 1: # 至少要有一帧
-                        visual_end_latent = kf_samples[:, :, 0:1, :, :].to(history_latents) # 视觉终点 (索引0)
-                        idx_visual_end = keyframe_idx_list[0]
-                        print(f"[关键帧逻辑] 已准备视觉终点(索引{idx_visual_end})潜变量")
-                        if len(keyframe_idx_list) >= 2 and kf_samples.shape[2] >= 2: # 如果有第二个关键帧
-                             visual_start_latent = kf_samples[:, :, 1:2, :, :].to(history_latents) # 视觉起点 (索引1)
-                             idx_visual_start = keyframe_idx_list[1]
-                             print(f"[关键帧逻辑] 已准备视觉起点(索引{idx_visual_start})潜变量")
-                        # else: # 注释掉，允许只处理单帧
-                        #     print(f"[关键帧逻辑] 警告: keyframes 数量 ({kf_samples.shape[2]}) 与索引数量 ({len(keyframe_idx_list)}) 不完全匹配，但至少有终点帧")
-                        #     keyframe_idx_list = keyframe_idx_list[:kf_samples.shape[2]] # 确保索引列表不超过实际帧数
-                    else:
-                         print(f"[关键帧逻辑] 警告: keyframes 时间维度为0，关键帧引导将禁用")
-                         keyframe_idx_list = []
+            if start_latent_out is not None and "samples" in start_latent_out:
+                # 起始潜变量是必需的，应用VAE缩放因子
+                vs_latent = start_latent_out["samples"]
+                if vs_latent is not None and vs_latent.shape[2] > 0: # 检查时间维度是否有效
+                     visual_start_latent = vs_latent * vae_scaling_factor
+                     visual_start_latent = visual_start_latent.to(dtype=dtype, device="cpu") # 准备在CPU上
+                     print(f"[关键帧逻辑] 已准备起始潜变量 (来自start_latent_out)，形状: {visual_start_latent.shape}")
                 else:
-                    print(f"[关键帧逻辑] 警告: keyframes 格式不正确 (shape: {kf_samples.shape})，关键帧引导将禁用")
-                    keyframe_idx_list = [] # 禁用关键帧逻辑
+                    raise ValueError("输入的起始潜变量无效或为空！")
             else:
-                print(f"[关键帧逻辑] 未提供关键帧或索引列表为空，关键帧引导将禁用")
-                keyframe_idx_list = [] # 确保禁用
-            
-            # 逐段生成
-            for latent_padding in latent_paddings:
-                print(f"[FramePack Sampler] 生成分段 {latent_padding + 1}/{total_latent_sections}")
-                is_last_section = latent_padding == 0
-                latent_padding_size = latent_padding * latent_window_size
-                
-                print(f'  - 填充大小 = {latent_padding_size}, 是否最后分段 = {is_last_section}')
-                
-                # 创建和分割索引
-                indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split(
-                    [1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1
-                )
-                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-                
-                # 计算当前分段索引
-                current_section_index = total_latent_sections - latent_padding - 1
-                forward_section_no = current_section_index # 使用 forward_section_no 表达更清晰
-                
-                # --- 开始: 关键帧处理逻辑 (模仿参考代码 clean_latents_pre) ---
-                default_base_latent = torch.zeros_like(history_latents[:, :, :1, :, :])
-                target_latent = default_base_latent
-                calculated_weight = 1.0
+                 raise ValueError("未提供有效的起始潜变量 (start_latent_out)！")
 
-                # --- 修改: 处理双关键帧和单关键帧 ---
-                if len(keyframe_idx_list) == 2 and visual_end_latent is not None and visual_start_latent is not None:
-                    # --- 情况A: 双关键帧 ---
-                    print(f"[关键帧逻辑] 处理分段{forward_section_no}/{total_latent_sections-1} (双关键帧模式)")
-                    if forward_section_no == idx_visual_start:
-                        # A.1: 到达视觉起点帧 (最后一个处理的分段 N-1)
-                        target_latent = visual_start_latent
-                        calculated_weight = keyframe_guidance_strength
-                        print(f"  -> 目标: 视觉起点, 权重: {calculated_weight:.2f} (最大)")
-                    else: # A.2: 未到达视觉起点帧 (包括视觉终点帧 0)
-                        target_latent = visual_end_latent # 主要使用视觉终点作为目标
-                        segment_width = idx_visual_start - idx_visual_end
-                        if segment_width > 0:
-                            # --- 保持+线性衰减 (恢复线性) ---
-                            transition_sections = segment_width # 总过渡段数
-                            hold_ratio = 0.1 # 保持权重的比例 (保持上次设置的值，后续可调)
-                            hold_sections = math.floor(transition_sections * hold_ratio)
-
-                            print(f"    - 总过渡段数: {transition_sections}, 保持段数: {hold_sections}")
-
-                            if forward_section_no <= hold_sections:
-                                # 在保持期内，使用最大权重
-                                calculated_weight = keyframe_guidance_strength
-                                print(f"    -> 目标: 视觉终点, 权重: {calculated_weight:.2f} (保持期)")
-                            else:
-                                # 在衰减期内，计算递减权重 t (线性)
-                                decay_sections_total = transition_sections - hold_sections
-                                if decay_sections_total > 0:
-                                    decay_progress = (forward_section_no - hold_sections -1) / decay_sections_total
-                                    decay_progress = max(0.0, min(1.0, decay_progress)) # 限制范围
-                                    t = 1.0 - decay_progress # t 从 1 递减到 0 (恢复线性)
-                                    # t = 1.0 - decay_progress**2 # 注释掉非线性
-                                    calculated_weight = 1.0 + (keyframe_guidance_strength - 1.0) * t
-                                    # print(f"    -> 目标: 视觉终点, 权重: {calculated_weight:.2f} (衰减期 t={t:.2f}, 非线性)") # 注释掉
-                                    print(f"    -> 目标: 视觉终点, 权重: {calculated_weight:.2f} (衰减期 t={t:.2f}, 线性)") # 更新日志说明
-                                else:
-                                    calculated_weight = keyframe_guidance_strength # 保持最大权重
-                                    print(f"    -> 目标: 视觉终点, 权重: {calculated_weight:.2f} (衰减期长度为0)")
-                            # --- 权重计算修改结束 ---
-                        else: # 如果总共只有1段 (width=0) 或索引错误
-                            calculated_weight = keyframe_guidance_strength
-                            print(f"  -> 目标: 视觉终点, 权重: {calculated_weight:.2f} (单段/错误)")
-                elif len(keyframe_idx_list) == 1 and visual_end_latent is not None:
-                    # --- 情况B: 单关键帧 (视觉终点帧) ---
-                     print(f"[关键帧逻辑] 处理分段{forward_section_no}/{total_latent_sections-1} (单关键帧模式)")
-                     target_latent = visual_end_latent
-                     calculated_weight = keyframe_guidance_strength # 全程使用最大强度
-                     print(f"  -> 目标: 视觉终点 (唯一), 权重: {calculated_weight:.2f} (最大)")
+            # 处理可选的目标潜变量
+            if target_latent_out is not None and "samples" in target_latent_out and target_start_index >= 0:
+                vt_latent = target_latent_out["samples"]
+                if vt_latent is not None and vt_latent.shape[2] > 0: # 检查时间维度是否有效
+                     visual_target_latent = vt_latent * vae_scaling_factor
+                     visual_target_latent = visual_target_latent.to(dtype=dtype, device="cpu") # 准备在CPU上
+                     print(f"[关键帧逻辑] 已准备目标潜变量 (来自target_latent_out)，目标索引: {target_start_index}，形状: {visual_target_latent.shape}")
+                     # 确保目标索引在范围内
+                     if target_start_index >= total_latent_sections:
+                         print(f"[关键帧逻辑] 警告: 目标索引 {target_start_index} 超出总分段数 {total_latent_sections}，将调整为最后一个分段 {total_latent_sections - 1}")
+                         target_start_index = total_latent_sections - 1
+                     # 确保目标索引不为0
+                     if target_start_index == 0:
+                         print(f"[关键帧逻辑] 警告: 目标索引不能为0，已禁用目标引导。")
+                         target_start_index = -1 # 禁用目标
+                         visual_target_latent = None
                 else:
-                    # --- 情况C: 无有效关键帧 ---
-                    print(f"[关键帧逻辑] 分段{forward_section_no}: 关键帧引导未激活或配置错误")
-                # --- 关键帧处理逻辑结束 ---
-                
-                # 应用计算出的目标和权重
-                clean_latents_pre = target_latent * calculated_weight
-                
-                # --- 移除历史注入，使用原始历史 --- 
-                clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                # print(f"[关键帧逻辑] 分段{forward_section_no}: 使用原始历史 clean_latents_post") # 这行日志太频繁，可以注释掉
+                    print(f"[关键帧逻辑] 提供的目标潜变量为空或无效，已禁用目标引导。")
+                    target_start_index = -1 # 禁用目标
+                    visual_target_latent = None
+            else:
+                print(f"[关键帧逻辑] 未提供有效的目标潜变量或目标索引，禁用目标引导。")
+                target_start_index = -1 # 禁用目标
+                visual_target_latent = None
+            # ------------------------------------------
 
-                # --- 拼接最终的 clean_latents --- 
-                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-                # --- 结束: 关键帧处理逻辑 ---
+            # 重置旧的变量，以防意外使用
+            visual_end_latent = None 
+            idx_visual_end = -1
+            idx_visual_start = 0 # 起点固定为0
+            
+            # 在循环开始前准备好关键帧潜变量 - 修改：逻辑已移到上面处理输入的部分
+            # if keyframes is not None and len(keyframe_idx_list) >= 1:
+            #     ...
+            # else:
+            #     ...
+
+            # --- 修改: 从前向后逐段生成 ---
+            for current_section_index in range(total_latent_sections):
+                print(f"[FramePack Sampler] 生成分段 {current_section_index + 1}/{total_latent_sections}")
+                is_first_section = current_section_index == 0
+                is_last_section = current_section_index == total_latent_sections - 1
+
+                # --- 修改: 参照参考代码定义索引分割 ---
+                indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
+                # 分割方式: [起始目标帧(1), 4x历史(16), 2x历史(2), 1x历史(1), 当前窗口(window_size)]
+                clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
+                    [1, 16, 2, 1, latent_window_size], dim=1
+                )
+                # 用于 sample_hunyuan 的 clean_latents 参数的索引
+                clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+
+                # --- 修改: 关键帧处理逻辑 (计算 target_latent 和 weight) ---
+                # 使用 forward_section_no 表达更清晰，即 current_section_index
+                forward_section_no = current_section_index
+
+                # 初始化默认目标 (零潜变量) 和权重
+                # 需要创建一个形状正确的零张量作为默认目标
+                # 修改：使用 visual_start_latent (它现在是必需的) 的形状
+                # if visual_start_latent is not None: 
+                #     default_target_shape = visual_start_latent.shape
+                # else:
+                #     # 创建一个基于配置的形状 (B=1, C=16, T=1, H, W)
+                #     default_target_shape = (batch_size, 16, 1, latent_height, latent_width)
+                default_target_shape = visual_start_latent.shape # 直接使用start_latent的形状
+
+                # 确保在正确的设备和类型上创建
+                default_target_latent = torch.zeros(default_target_shape, dtype=dtype, device=device)
+
+                target_latent = default_target_latent # 默认为零
+                calculated_weight = 1.0 # 默认权重
+
+                # --- 关键帧引导逻辑 (与之前类似，基于 forward_section_no) ---
+                # --- 修改：实现新的 Start -> Target 引导逻辑 ---
+                print(f"[关键帧逻辑] 处理分段 {forward_section_no}/{total_latent_sections - 1} (Start-Target模式)")
+
+                # --- 修改：持续引导，中途切换 --- 
+                if visual_target_latent is not None and target_start_index > 0 and forward_section_no >= target_start_index:
+                    # 达到或超过目标索引，强引导至目标
+                    target_latent = visual_target_latent.to(device=device, dtype=dtype)
+                    calculated_weight = keyframe_guidance_strength
+                    print(f"  -> 分段达到/超过目标索引({target_start_index})，强引导至目标，权重: {calculated_weight:.2f}")
+                else:
+                    # 在目标索引之前 (包括索引0) 或无目标时，强引导至起点
+                    target_latent = visual_start_latent.to(device=device, dtype=dtype)
+                    calculated_weight = keyframe_guidance_strength
+                    print(f"  -> 引导至起点，权重: {calculated_weight:.2f}")
                 
+                # --- 修改: 准备 clean_latents (参照参考代码) --- 
+                # 需要从 history_latents 末尾提取历史信息
+                # 处理 history_latents 不足的情况 (特别是第一帧)
+
+                # 需要的历史长度: 1 (1x) + 2 (2x) + 16 (4x) = 19
+                required_history_len = 1 + 2 + 16
+                current_history_len = history_latents.shape[2]
+
+                # 创建零值占位符，用于填充不足的历史
+                zero_latent_1x = torch.zeros((batch_size, 16, 1, latent_height, latent_width), dtype=dtype, device=device)
+                zero_latent_2x = torch.zeros((batch_size, 16, 2, latent_height, latent_width), dtype=dtype, device=device)
+                zero_latent_4x = torch.zeros((batch_size, 16, 16, latent_height, latent_width), dtype=dtype, device=device)
+
+                if current_history_len == 0:
+                    # 第一帧，完全没有历史
+                    clean_latents_1x = zero_latent_1x
+                    clean_latents_2x = zero_latent_2x
+                    clean_latents_4x = zero_latent_4x
+                    print(f"[FramePack Sampler] 第一个分段，使用零历史")
+                else:
+                    # 从历史末尾提取，不足部分用零填充
+                    print(f"[FramePack Sampler] 从历史潜变量(长度 {current_history_len})末尾提取上下文")
+                    # 提取可用历史
+                    available_history = history_latents[:, :, -min(current_history_len, required_history_len):, :, :].to(device=device, dtype=dtype)
+                    available_len = available_history.shape[2]
+
+                    # 分配给 1x, 2x, 4x (从后往前)
+                    len_1x = min(available_len, 1)
+                    start_idx_1x = available_len - len_1x
+                    actual_1x = available_history[:, :, start_idx_1x : start_idx_1x + len_1x, :, :]
+                    clean_latents_1x = torch.cat([zero_latent_1x[:, :, :(1 - len_1x), :, :], actual_1x], dim=2) if len_1x < 1 else actual_1x
+
+                    available_len -= len_1x
+                    len_2x = min(available_len, 2)
+                    start_idx_2x = available_len - len_2x
+                    actual_2x = available_history[:, :, start_idx_2x : start_idx_2x + len_2x, :, :]
+                    clean_latents_2x = torch.cat([zero_latent_2x[:, :, :(2 - len_2x), :, :], actual_2x], dim=2) if len_2x < 2 else actual_2x
+
+                    available_len -= len_2x
+                    len_4x = min(available_len, 16)
+                    start_idx_4x = available_len - len_4x
+                    actual_4x = available_history[:, :, start_idx_4x : start_idx_4x + len_4x, :, :]
+                    clean_latents_4x = torch.cat([zero_latent_4x[:, :, :(16 - len_4x), :, :], actual_4x], dim=2) if len_4x < 16 else actual_4x
+
+                    print(f"  - 提取长度: 1x={clean_latents_1x.shape[2]}, 2x={clean_latents_2x.shape[2]}, 4x={clean_latents_4x.shape[2]}")
+
+
+                # 组合最终的 clean_latents
+                # --- 修改：实现三阶段引导逻辑 ---
+                is_guiding_target = visual_target_latent is not None and target_start_index > 0
+                
+                if is_guiding_target and forward_section_no == target_start_index:
+                    # 第二阶段：过渡到目标 (仅在此分段使用混合)
+                    alpha = 0.5 # 混合比例
+                    weighted_target = target_latent * calculated_weight
+                    # 形状检查
+                    if clean_latents_1x.shape != weighted_target.shape:
+                         print(f"[FramePack Sampler] 警告：混合引导时形状不匹配！ History: {clean_latents_1x.shape}, Target: {weighted_target.shape}. 跳过混合，使用 [target, target]")
+                         mixed_latent = weighted_target # 回退到之前的强引导
+                    else:
+                         mixed_latent = (1 - alpha) * clean_latents_1x + alpha * weighted_target
+                         print(f"[FramePack Sampler] 过渡至目标 (混合 alpha={alpha})")
+                    
+                    clean_latents = torch.cat([weighted_target, mixed_latent], dim=2)
+                    print(f"[FramePack Sampler] 组合 clean_latents: [target, mixed(history, target)]")
+
+                elif is_guiding_target and forward_section_no > target_start_index:
+                     # 第三阶段：从目标状态开始演变 (使用偏向历史的混合上下文)
+                     alpha_evo = 0.1 # 演变阶段混合比例，更偏向历史
+                     weighted_target = target_latent * calculated_weight # 确保 target_latent 是目标潜变量
+                     # 形状检查
+                     if clean_latents_1x.shape != weighted_target.shape:
+                         print(f"[FramePack Sampler] 警告：演变阶段混合时形状不匹配！ History: {clean_latents_1x.shape}, Target: {weighted_target.shape}. 使用 [target, history_1x]")
+                         mixed_latent_evo = clean_latents_1x # 回退到只使用历史
+                     else:
+                         mixed_latent_evo = (1 - alpha_evo) * clean_latents_1x + alpha_evo * weighted_target
+                         print(f"[FramePack Sampler] 从目标演变 (混合上下文 alpha={alpha_evo})")
+                    
+                     clean_latents = torch.cat([weighted_target, mixed_latent_evo], dim=2)
+                     print(f"[FramePack Sampler] 组合 clean_latents: [target, mixed_evo(history, target)]")
+
+                else: # 对应 forward_section_no < target_start_index 或无目标的情况
+                    # 第一阶段：引导至起点 (使用真实历史)
+                    # 注意：此时 target_latent 实际上是 visual_start_latent
+                    weighted_start = target_latent * calculated_weight
+                    clean_latents = torch.cat([weighted_start, clean_latents_1x], dim=2)
+                    print(f"[FramePack Sampler] 引导至起点，组合 clean_latents: [start, history_1x]")
+                # -----------------------------------
+                
+                # 结构: [目标关键帧(加权), 1x历史]
+                # clean_latents = torch.cat([target_latent * calculated_weight, clean_latents_1x], dim=2)
+                print(f"[FramePack Sampler] 准备好的 clean_latents 形状: {clean_latents.shape}")
+                print(f"  - clean_latents_1x 形状: {clean_latents_1x.shape}")
+                print(f"  - clean_latents_2x 形状: {clean_latents_2x.shape}")
+                print(f"  - clean_latents_4x 形状: {clean_latents_4x.shape}")
+
                 # 设置teacache
                 if hasattr(transformer, 'initialize_teacache'):
                     if use_teacache:
@@ -467,15 +509,15 @@ class FramePackDiffusersSampler:
                 
                 # 执行采样
                 with torch.autocast(device_type=model_management.get_autocast_device(device), dtype=dtype, enabled=True):
-                    # 更新当前分段索引
-                    print(f"[FramePack Sampler] 开始处理分段 {current_section_index + 1}/{total_latent_sections}")
-                    
+                    # 更新当前分段索引 (虽然循环变量就是它，但为了回调函数清晰)
+                    # print(f"[FramePack Sampler] 开始处理分段 {current_section_index + 1}/{total_latent_sections}") # 日志位置调整
+
                     generated_latents = sample_hunyuan(
                         transformer=transformer,
                         sampler=sampler,  # 使用用户选择的采样器
-                        initial_latent=initial_latent,  # 使用初始潜变量(I2V模式)
-                        concat_latent=None,
-                        strength=denoise_strength,  # 应用去噪强度
+                        initial_latent=initial_latent,  # 设为 None，由 clean_latents 控制
+                        concat_latent=None, # -> 参考代码未使用，保持None
+                        strength=denoise_strength,  # 应用去噪强度 (I2V时可能有用)
                         width=width,
                         height=height,
                         frames=num_frames_per_window,
@@ -494,17 +536,17 @@ class FramePackDiffusersSampler:
                         negative_prompt_poolers=clip_l_pooler_n,
                         dtype=dtype,
                         device=device,
-                        negative_kwargs=None,
+                        negative_kwargs=None, # -> 参考代码未使用，保持None
                         callback=callback_adapter,  # 使用我们的适配器回调函数
-                        # 添加额外参数
-                        image_embeddings=image_embeddings,
-                        latent_indices=latent_indices,
-                        clean_latents=clean_latents,
-                        clean_latent_indices=clean_latent_indices,
-                        clean_latents_2x=clean_latents_2x,
-                        clean_latent_2x_indices=clean_latent_2x_indices,
-                        clean_latents_4x=clean_latents_4x,
-                        clean_latent_4x_indices=clean_latent_4x_indices,
+                        # 添加额外参数 - 使用新的索引和clean_latents
+                        image_embeddings=image_embeddings, # CLIP Vision 特征
+                        latent_indices=latent_indices, # 当前窗口索引 [T]
+                        clean_latents=clean_latents, # [目标帧(加权), 1x历史] [B,C,1+1,H,W]
+                        clean_latent_indices=clean_latent_indices, # 对应 clean_latents 的索引 [1+1]
+                        clean_latents_2x=clean_latents_2x, # [2x历史] [B,C,2,H,W]
+                        clean_latent_2x_indices=clean_latent_2x_indices, # [2]
+                        clean_latents_4x=clean_latents_4x, # [4x历史] [B,C,16,H,W]
+                        clean_latent_4x_indices=clean_latent_4x_indices, # [16]
                     )
                 
                 # 检查采样后的内存状态
@@ -519,50 +561,61 @@ class FramePackDiffusersSampler:
                 except Exception as e:
                     print(f"[FramePack Sampler] 采样后内存检查出错: {e}")
                 
-                # 如果是最后一段，连接视觉终点潜变量 (保持修正后的逻辑)
-                if is_last_section:
-                    # 移除静态帧添加逻辑，防止视频开头出现静态画面
-                    print("[FramePack Sampler] 处理最后分段 (时间上的第一段)")
-                    # 不再额外添加静态帧，保持动态效果
-                    print(f"[FramePack Sampler] 保持动态开始，形状: {generated_latents.shape}")
-                    
-                    # 以下代码会导致视频开头出现静态帧，现已移除
-                    # if visual_end_latent is not None: 
-                    #     concat_frame = visual_end_latent.to(dtype=generated_latents.dtype, device=generated_latents.device)
-                    #     generated_latents = torch.cat([concat_frame, generated_latents], dim=2)
-                    #     print(f"[FramePack Sampler] 成功拼接视觉终点帧 (来自索引0), 新形状: {generated_latents.shape}")
-                    # else:
-                    #     print("[FramePack Sampler] 关键帧信息不足，拼接默认零潜变量")
-                    #     default_first = torch.zeros_like(generated_latents[:, :, :1, :, :])
-                    #     generated_latents = torch.cat([default_first, generated_latents], dim=2)
-                
-                # 更新总帧数和历史潜变量
-                total_generated_latent_frames += int(generated_latents.shape[2])
-                history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
-                
-                # 获取实际生成的潜变量
-                real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
-                
-                # 如果是最后一段，停止生成
-                if is_last_section:
-                    break
-            
-            print("[FramePack Sampler] 采样完成.")
-            print(f"[FramePack Sampler] 输出形状: {real_history_latents.shape}")
-            
+                # --- 修改: 更新历史潜变量和总帧数 ---
+                # 将生成的潜变量移到CPU并拼接到 history_latents
+                current_generated_frames = generated_latents.shape[2]
+                history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+                total_generated_latent_frames += current_generated_frames
+                print(f"[FramePack Sampler] 分段 {current_section_index + 1} 生成了 {current_generated_frames} 帧，总帧数: {total_generated_latent_frames}")
+                print(f"[FramePack Sampler] 更新后 history_latents 形状: {history_latents.shape}")
+
+                # 移除旧的反向逻辑和最后分段的特殊处理
+                # if is_last_section:
+                #     # 移除静态帧添加逻辑，防止视频开头出现静态画面
+                #     print("[FramePack Sampler] 处理最后分段 (时间上的第一段)")
+                #     # 不再额外添加静态帧，保持动态效果
+                #     print(f"[FramePack Sampler] 保持动态开始，形状: {generated_latents.shape}")
+
+                # 更新总帧数和历史潜变量 (已移到上面)
+                # total_generated_latent_frames += int(generated_latents.shape[2])
+                # history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+
+                # 获取实际生成的潜变量 (已移到循环外)
+                # real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+
+                # 如果是最后一段，停止生成 (现在由 for 循环控制)
+                # if is_last_section:
+                #     break
+
+            # --- 修改: 循环结束后处理最终结果 ---
+            print("[FramePack Sampler] 所有分段采样完成.")
+
+            # 检查最终生成的帧数是否合理
+            expected_total_frames = total_second_length * fps
+            # 注意: Hunyuan Video 的 latent_window_size 和 num_frames_per_window 计算可能导致实际帧数略有差异
+            print(f"[FramePack Sampler] 预期总帧数: {expected_total_frames:.1f}, 实际生成潜变量帧数: {total_generated_latent_frames}")
+            print(f"[FramePack Sampler] 最终输出 history_latents 形状: {history_latents.shape}")
+
             # 记录实际调用的采样信息
             print(f"[FramePack Sampler] 📊 采样信息: 窗口大小={latent_window_size}, 帧数/窗口={num_frames_per_window}")
-            
+
             # 确保进度条显示为完成状态
-            progress_remaining = total_steps - (current_section_index + 1) * steps
-            if progress_remaining > 0:
-                print(f"[FramePack Sampler] 更新进度条到完成状态 (剩余 {progress_remaining} 步)")
-                progress_bar.update(progress_remaining)
+            # 计算已完成的总步数
+            completed_steps = total_latent_sections * steps
+            progress_remaining = total_steps - completed_steps # total_steps = steps * total_latent_sections
+            if progress_remaining != 0: # 理论上应该为0，除非计算有误或提前中断
+                 print(f"[FramePack Sampler] 警告: 进度计算可能存在偏差，剩余 {progress_remaining} 步")
+                 # 强制更新到100%
+                 progress_bar.update(progress_remaining)
+
             print("[FramePack Sampler] ✅ 进度: 100% 完成!")
-            
+
             # 返回结果，应用VAE缩放因子
-            return ({"samples": real_history_latents.to(model_management.intermediate_device()) / vae_scaling_factor},)
-            
+            # history_latents 已经在CPU上
+            final_latents = history_latents.to(model_management.intermediate_device()) / vae_scaling_factor
+            print(f"[FramePack Sampler] 返回最终潜变量，形状: {final_latents.shape}")
+            return ({"samples": final_latents},)
+
         except Exception as e:
             # 详细记录错误信息
             error_message = f"[FramePack Sampler] ❌ 错误: {str(e)}"
@@ -595,7 +648,7 @@ class FramePackDiffusersSampler:
                 print("[FramePack Sampler] 创建空潜变量作为错误恢复...")
                 # 创建一个小的空潜变量
                 empty_latent = torch.zeros(
-                    (1, 16, 1, height // 8, width // 8), 
+                    (1, 16, 1, height // 8, width // 8), # 保持通道数16
                     dtype=torch.float32,
                     device=model_management.intermediate_device()
                 )
@@ -604,7 +657,7 @@ class FramePackDiffusersSampler:
                 print(f"[FramePack Sampler] 创建空潜变量失败: {fallback_error}")
                 # 最小的可能潜变量
                 minimal_latent = torch.zeros(
-                    (1, 4, 1, 8, 8), 
+                    (1, 16, 1, 8, 8), # 保持通道数16
                     dtype=torch.float32,
                     device=model_management.intermediate_device()
                 )
