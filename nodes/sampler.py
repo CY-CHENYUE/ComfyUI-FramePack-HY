@@ -55,6 +55,7 @@ class FramePackDiffusersSampler:
                 "fp_pipeline": ("FP_DIFFUSERS_PIPELINE",), # 接收来自加载节点的 Pipeline
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
+                "clip_vision": ("CLIP_VISION_OUTPUT", {"tooltip": "CLIP Vision的输出，用于图像引导"}),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 10000}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}), # real guidance scale
                 "guidance_scale": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.1}), # distilled guidance scale
@@ -67,19 +68,11 @@ class FramePackDiffusersSampler:
                             {"default": "unipc", 
                              "tooltip": "采样器类型，目前仅支持unipc"}),
                 "start_latent_out": ("LATENT", {"tooltip": "来自Keyframe节点的起始潜变量"}),
-                "target_latent_out": ("LATENT", {"tooltip": "(可选) 来自Keyframe节点的目标潜变量"}),
-                "target_index_out": ("INT", {"tooltip": "(可选) 目标潜变量生效的分段索引"}),
-            },
-            "optional": {
-                # 从CreateKeyframes节点直接连接的视频参数
                 "video_length_seconds": ("video_length_seconds", {"default": None, 
                                                   "tooltip": "从CreateKeyframes节点获取的视频时长(秒)，优先级最高"}),
                 "video_fps": ("video_fps", {"default": None,  
                                      "tooltip": "从CreateKeyframes节点获取的帧率(fps)，优先级最高"}),
-                "window_size": ("window_size", {"default": None, 
-                                       "tooltip": "从CreateKeyframes节点获取的窗口大小，优先级最高"}),
-                
-                "clip_vision": ("CLIP_VISION_OUTPUT", {"tooltip": "CLIP Vision的输出，用于图像引导"}),
+                                     # 从CreateKeyframes节点直接连接的视频参数
                 "shift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1, 
                                    "tooltip": "影响运动幅度，数值越高运动越强"}),
                 "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "使用teacache加速采样"}),
@@ -87,10 +80,19 @@ class FramePackDiffusersSampler:
                                              "tooltip": "teacache相对L1损失阈值"}),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, 
                                                "tooltip": "I2V模式的去噪强度(当前未使用，未来可能用于start_latent)"}),
+                                       
+            },
+            "optional": {
+                "window_size": ("window_size", {"default": None, 
+                                       "tooltip": "从CreateKeyframes节点获取的窗口大小，优先级最高"}),
+                "target_latent_out": ("LATENT", {"tooltip": "(可选) 来自Keyframe节点的目标潜变量"}),
+                "target_index_out": ("target_index_out", {"tooltip": "(可选) 目标潜变量生效的分段索引"}), 
                 # 关键帧相关参数
                 "keyframe_guidance_strength": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 10.0, "step": 0.1, 
-                                                         "tooltip": "关键帧引导强度。控制关键帧对视频的影响程度。值越高，视频在关键帧位置越接近目标图像，过渡效果越明显"})
-            }
+                                                         "tooltip": "关键帧引导强度。控制关键帧对视频的影响程度。值越高，视频在关键帧位置越接近目标图像，过渡效果越明显"}),
+                "transition_window": ("transition_window", {"default": 0, 
+                                        "tooltip": "从CreateKeyframes节点获取的过渡窗口大小，控制过渡的平滑度"})
+           }
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -104,7 +106,7 @@ class FramePackDiffusersSampler:
                clip_vision=None, shift=0.0, use_teacache=True, 
                teacache_thresh=0.15, denoise_strength=1.0, 
                start_latent_out=None, target_latent_out=None, target_index_out=-1,
-               keyframe_guidance_strength=1.5):
+               keyframe_guidance_strength=1.5, transition_window=0):
 
         # 优先使用从CreateKeyframes节点连接的视频参数
         if video_length_seconds is not None:
@@ -382,16 +384,63 @@ class FramePackDiffusersSampler:
                 # --- 修改：实现新的 Start -> Target 引导逻辑 ---
                 print(f"[关键帧逻辑] 处理分段 {forward_section_no}/{total_latent_sections - 1} (Start-Target模式)")
 
-                # --- 修改：持续引导，中途切换 --- 
-                if visual_target_latent is not None and target_start_index > 0 and forward_section_no >= target_start_index:
-                    # 达到或超过目标索引，强引导至目标
-                    target_latent = visual_target_latent.to(device=device, dtype=dtype)
-                    calculated_weight = keyframe_guidance_strength
-                    print(f"  -> 分段达到/超过目标索引({target_start_index})，强引导至目标，权重: {calculated_weight:.2f}")
+                # --- 修改：实现渐进式过渡 --- 
+                if visual_target_latent is not None and target_start_index > 0:
+                    # 计算距离目标索引的距离
+                    distance_to_target = target_start_index - forward_section_no
+                    
+                    # 设置过渡区间
+                    # 优先使用从 CreateKeyframes 节点传入的过渡窗口大小
+                    if transition_window > 0:
+                        transition_window_size = min(transition_window, target_start_index)
+                        print(f"[关键帧逻辑] 使用从CreateKeyframes节点传入的过渡窗口大小: {transition_window_size}")
+                    else:
+                        # 否则自动计算：在目标索引前几个分段开始过渡
+                        transition_window_size = min(5, target_start_index // 2)  # 过渡窗口，至少1个分段，最多5个分段
+                        transition_window_size = max(1, transition_window_size)  # 确保至少有1个分段的过渡
+                        print(f"[关键帧逻辑] 自动计算过渡窗口大小: {transition_window_size}")
+                    
+                    if forward_section_no >= target_start_index:
+                        # 已达到或超过目标位置，完全引导至目标
+                        target_latent = visual_target_latent.to(device=device, dtype=dtype)
+                        calculated_weight = keyframe_guidance_strength
+                        transition_progress = 1.0  # 完全过渡到目标
+                        print(f"  -> 分段已达到/超过目标索引({target_start_index})，完全引导至目标，权重: {calculated_weight:.2f}")
+                    
+                    elif distance_to_target <= transition_window_size:
+                        # 在过渡窗口内，计算过渡进度 (从0到1)
+                        transition_progress = 1.0 - (distance_to_target / transition_window_size)
+                        
+                        # 根据过渡进度混合起点和目标潜变量
+                        start_weight = (1.0 - transition_progress) * keyframe_guidance_strength
+                        target_weight = transition_progress * keyframe_guidance_strength
+                        
+                        # 计算混合潜变量
+                        if visual_start_latent.shape == visual_target_latent.shape:
+                            # 直接在潜空间混合
+                            target_latent = ((1.0 - transition_progress) * visual_start_latent + 
+                                             transition_progress * visual_target_latent).to(device=device, dtype=dtype)
+                            calculated_weight = keyframe_guidance_strength  # 保持总体权重不变
+                            print(f"  -> 在过渡窗口内 ({distance_to_target}/{transition_window_size})，混合引导，"
+                                  f"进度: {transition_progress:.2f}，权重: {calculated_weight:.2f}")
+                        else:
+                            # 形状不匹配时，仍使用起点但降低权重，为过渡做准备
+                            target_latent = visual_start_latent.to(device=device, dtype=dtype)
+                            # 随着接近目标，逐渐降低起点权重
+                            calculated_weight = start_weight
+                            print(f"  -> 在过渡窗口内 ({distance_to_target}/{transition_window_size})，"
+                                  f"降低起点权重至 {calculated_weight:.2f}，为过渡做准备")
+                    else:
+                        # 在过渡窗口外，仍然引导至起点
+                        target_latent = visual_start_latent.to(device=device, dtype=dtype)
+                        calculated_weight = keyframe_guidance_strength
+                        transition_progress = 0.0  # 尚未开始过渡
+                        print(f"  -> 距离目标尚远 ({distance_to_target} > {transition_window_size})，引导至起点，权重: {calculated_weight:.2f}")
                 else:
-                    # 在目标索引之前 (包括索引0) 或无目标时，强引导至起点
+                    # 无目标或目标索引无效时，引导至起点
                     target_latent = visual_start_latent.to(device=device, dtype=dtype)
                     calculated_weight = keyframe_guidance_strength
+                    transition_progress = 0.0  # 无过渡
                     print(f"  -> 引导至起点，权重: {calculated_weight:.2f}")
                 
                 # --- 修改: 准备 clean_latents (参照参考代码) --- 
@@ -439,52 +488,56 @@ class FramePackDiffusersSampler:
                     clean_latents_4x = torch.cat([zero_latent_4x[:, :, :(16 - len_4x), :, :], actual_4x], dim=2) if len_4x < 16 else actual_4x
 
                     print(f"  - 提取长度: 1x={clean_latents_1x.shape[2]}, 2x={clean_latents_2x.shape[2]}, 4x={clean_latents_4x.shape[2]}")
-
-
-                # 组合最终的 clean_latents
-                # --- 修改：实现三阶段引导逻辑 ---
+                
+                # --- 修改：优化渐进式过渡的clean_latents构建 ---
+                # 存储过渡进度供后续使用
+                current_transition_progress = 0.0 if 'transition_progress' not in locals() else transition_progress
+                
+                # --- 修改：实现三阶段引导逻辑，但基于渐进式过渡 ---
                 is_guiding_target = visual_target_latent is not None and target_start_index > 0
                 
-                if is_guiding_target and forward_section_no == target_start_index:
-                    # 第二阶段：过渡到目标 (仅在此分段使用混合)
-                    alpha = 0.5 # 混合比例
-                    weighted_target = target_latent * calculated_weight
-                    # 形状检查
-                    if clean_latents_1x.shape != weighted_target.shape:
-                         print(f"[FramePack Sampler] 警告：混合引导时形状不匹配！ History: {clean_latents_1x.shape}, Target: {weighted_target.shape}. 跳过混合，使用 [target, target]")
-                         mixed_latent = weighted_target # 回退到之前的强引导
+                if is_guiding_target:
+                    if current_transition_progress > 0 and current_transition_progress < 1.0:
+                        # 过渡阶段：混合clean_latents
+                        # 历史帧的重要性随过渡进度增加
+                        history_weight = 0.5 + 0.3 * current_transition_progress
+                        # 确保形状匹配
+                        if clean_latents_1x.shape != target_latent.shape:
+                            print(f"[FramePack Sampler] 警告：混合引导时形状不匹配！使用默认策略")
+                            weighted_target = target_latent * calculated_weight
+                            clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
+                        else:
+                            # 混合策略：历史帧权重随过渡进度增加，以保持运动连贯性
+                            mixed_latent = (history_weight * clean_latents_1x + 
+                                            (1.0 - history_weight) * target_latent).to(device=device, dtype=dtype)
+                            weighted_target = target_latent * calculated_weight
+                            clean_latents = torch.cat([weighted_target, mixed_latent], dim=2)
+                            print(f"[FramePack Sampler] 过渡阶段混合 (进度:{current_transition_progress:.2f}, 历史权重:{history_weight:.2f})")
+                    
+                    elif current_transition_progress >= 1.0:
+                        # 已完全过渡到目标：使用更偏向历史的混合，以保持连贯性
+                        # 在目标之后，更多依赖历史帧以保持连贯的运动
+                        history_weight = 0.85  # 高度依赖历史帧
+                        weighted_target = target_latent * calculated_weight
+                        if clean_latents_1x.shape != target_latent.shape:
+                            clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
+                        else:
+                            mixed_latent = (history_weight * clean_latents_1x + 
+                                           (1.0 - history_weight) * target_latent).to(device=device, dtype=dtype)
+                            clean_latents = torch.cat([weighted_target, mixed_latent], dim=2)
+                            print(f"[FramePack Sampler] 目标后阶段混合 (历史权重:{history_weight:.2f})")
+                    
                     else:
-                         mixed_latent = (1 - alpha) * clean_latents_1x + alpha * weighted_target
-                         print(f"[FramePack Sampler] 过渡至目标 (混合 alpha={alpha})")
-                    
-                    clean_latents = torch.cat([weighted_target, mixed_latent], dim=2)
-                    print(f"[FramePack Sampler] 组合 clean_latents: [target, mixed(history, target)]")
-
-                elif is_guiding_target and forward_section_no > target_start_index:
-                     # 第三阶段：从目标状态开始演变 (使用偏向历史的混合上下文)
-                     alpha_evo = 0.1 # 演变阶段混合比例，更偏向历史
-                     weighted_target = target_latent * calculated_weight # 确保 target_latent 是目标潜变量
-                     # 形状检查
-                     if clean_latents_1x.shape != weighted_target.shape:
-                         print(f"[FramePack Sampler] 警告：演变阶段混合时形状不匹配！ History: {clean_latents_1x.shape}, Target: {weighted_target.shape}. 使用 [target, history_1x]")
-                         mixed_latent_evo = clean_latents_1x # 回退到只使用历史
-                     else:
-                         mixed_latent_evo = (1 - alpha_evo) * clean_latents_1x + alpha_evo * weighted_target
-                         print(f"[FramePack Sampler] 从目标演变 (混合上下文 alpha={alpha_evo})")
-                    
-                     clean_latents = torch.cat([weighted_target, mixed_latent_evo], dim=2)
-                     print(f"[FramePack Sampler] 组合 clean_latents: [target, mixed_evo(history, target)]")
-
-                else: # 对应 forward_section_no < target_start_index 或无目标的情况
-                    # 第一阶段：引导至起点 (使用真实历史)
-                    # 注意：此时 target_latent 实际上是 visual_start_latent
-                    weighted_start = target_latent * calculated_weight
-                    clean_latents = torch.cat([weighted_start, clean_latents_1x], dim=2)
-                    print(f"[FramePack Sampler] 引导至起点，组合 clean_latents: [start, history_1x]")
-                # -----------------------------------
+                        # 尚未开始过渡：正常使用起点和历史
+                        weighted_target = target_latent * calculated_weight
+                        clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
+                        print(f"[FramePack Sampler] 过渡前阶段，标准引导")
+                else:
+                    # 无目标情况，使用标准历史引导
+                    weighted_target = target_latent * calculated_weight
+                    clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
+                    print(f"[FramePack Sampler] 无目标，标准引导")
                 
-                # 结构: [目标关键帧(加权), 1x历史]
-                # clean_latents = torch.cat([target_latent * calculated_weight, clean_latents_1x], dim=2)
                 print(f"[FramePack Sampler] 准备好的 clean_latents 形状: {clean_latents.shape}")
                 print(f"  - clean_latents_1x 形状: {clean_latents_1x.shape}")
                 print(f"  - clean_latents_2x 形状: {clean_latents_2x.shape}")

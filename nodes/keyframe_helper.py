@@ -17,7 +17,7 @@ class CreateKeyframes_HY:
         return {
             "required": {
                 "keyframe_1": ("LATENT", {"tooltip": "定义视频起点的潜变量 (必需)"}),
-                "video_length_seconds": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 60.0, "step": 0.1,
+                "video_length_seconds": ("INT", {"default": 5, "min": 1, "max": 60, "step": 1,
                                                   "tooltip": "视频总时长(秒)，用于计算总分段数和验证索引"}),
                 "fps": ("INT", {"default": 24, "min": 1, "max": 60, "step": 1,
                                "tooltip": "视频帧率(每秒帧数)，用于计算总分段数"}),
@@ -28,11 +28,13 @@ class CreateKeyframes_HY:
                 "target_latent_in": ("LATENT", {"tooltip": "(可选) 定义视频演变目标的潜变量"}),
                 "target_index": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1, # -1 表示不使用目标
                                             "tooltip": "(可选) 目标潜变量开始强力影响视频的分段索引 (从0开始，-1表示不使用)"}),
+                "transition_window": ("INT", {"default": 0, "min": 0, "max": 20, "step": 1,
+                                              "tooltip": "过渡窗口大小(分段数)。设置为0时自动计算。较大的值会产生更长、更平滑的过渡"})
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT", "INT", "video_length_seconds", "video_fps", "window_size",)
-    RETURN_NAMES = ("start_latent_out", "target_latent_out", "target_index_out", "video_length_seconds", "fps", "window_size",)
+    RETURN_TYPES = ("LATENT", "video_length_seconds", "video_fps", "window_size", "LATENT", "target_index_out", "transition_window",)
+    RETURN_NAMES = ("start_latent_out",  "video_length_seconds", "fps", "window_size", "target_latent_out", "target_index_out","transition_window",)
     FUNCTION = "create_start_target_internal"
     CATEGORY = "FramePack"
     DESCRIPTION = """定义视频的起始潜变量和可选的目标潜变量及索引。
@@ -44,6 +46,7 @@ Sampler节点将使用这些信息来引导视频从起点开始，并在到达�
 1. 输入必需的 keyframe_1 作为视频起点。
 2. （可选）输入 target_latent_in 和 target_index。target_index 指定目标潜变量开始强力影响视频的分段。
 3. 设置视频参数以确保索引有效。
+4. （可选）设置 transition_window 控制过渡窗口大小，较大的值会产生更长、更平滑的过渡。
 
 注意：
 - target_index 必须在有效的分段范围内 [0, N-1]。
@@ -51,7 +54,7 @@ Sampler节点将使用这些信息来引导视频从起点开始，并在到达�
 """
 
     def create_start_target_internal(self, keyframe_1, video_length_seconds, fps, window_size,
-                                     target_latent_in=None, target_index=-1):
+                                     target_latent_in=None, target_index=-1, transition_window=0):
         print(f"[CreateKeyframes_HY (Start-Target Mode)] 处理起点和可选目标关键帧")
         print(f"[CreateKeyframes_HY (Start-Target Mode)] 视频参数: 时长={video_length_seconds}秒, 帧率={fps}fps, 窗口大小={window_size}")
 
@@ -82,6 +85,7 @@ Sampler节点将使用这些信息来引导视频从起点开始，并在到达�
         # --- 处理目标潜变量 (来自 target_latent_in) --- 
         target_latent_out_dict = None
         valid_target_index = -1
+        transition_window = transition_window  # 默认使用用户传入的值
         
         use_target = target_latent_in is not None and target_index >= 0
         
@@ -128,7 +132,18 @@ Sampler节点将使用这些信息来引导视频从起点开始，并在到达�
                 if use_target:
                      target_latent_out_dict = {"samples": target_latent_samples}
                      valid_target_index = target_index
-                     print(f"[CreateKeyframes_HY (Start-Target Mode)] 成功准备目标潜变量，索引: {valid_target_index}")
+                     
+                     # 计算合适的过渡窗口
+                     if transition_window <= 0:  # 如果用户未指定，自动计算
+                         # 默认使用目标索引的一半，但最少1，最多5
+                         transition_window = min(5, max(1, target_index // 2))
+                         print(f"[CreateKeyframes_HY (Start-Target Mode)] 自动计算过渡窗口大小: {transition_window}")
+                     else:
+                         # 使用用户指定的大小，但确保不超过目标索引
+                         transition_window = min(transition_window, target_index)
+                         print(f"[CreateKeyframes_HY (Start-Target Mode)] 使用用户指定的过渡窗口大小: {transition_window}")
+                     
+                     print(f"[CreateKeyframes_HY (Start-Target Mode)] 成功准备目标潜变量，索引: {valid_target_index}，过渡窗口: {transition_window}")
                 else:
                      print(f"[CreateKeyframes_HY (Start-Target Mode)] 因验证或处理失败，目标潜变量被禁用")
         else:
@@ -138,6 +153,7 @@ Sampler节点将使用这些信息来引导视频从起点开始，并在到达�
         if not use_target:
             valid_target_index = -1
             target_latent_out_dict = None
+            transition_window = 0
 
         # --- 返回结果 --- 
         if target_latent_out_dict is None:
@@ -148,9 +164,10 @@ Sampler节点将使用这些信息来引导视频从起点开始，并在到达�
                                        dtype=dtype, device=device)
             target_latent_out_dict = {"samples": empty_latent}
             valid_target_index = -1
+            transition_window = 0
 
-        return (start_latent_out_dict, target_latent_out_dict, valid_target_index, 
-                video_length_seconds, fps, window_size)
+        return (start_latent_out_dict, video_length_seconds, fps, window_size, 
+                target_latent_out_dict, valid_target_index, transition_window)
 
 
 NODE_CLASS_MAPPINGS = {
