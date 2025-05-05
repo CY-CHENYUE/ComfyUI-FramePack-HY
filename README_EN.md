@@ -1,10 +1,16 @@
 # ComfyUI-FramePack-HY
 
+English | [中文版](README.md)
+
 This is a custom node package designed for ComfyUI, aimed at efficiently generating long videos using Hunyuan-DiT class models through segmented sampling (FramePack).
 
+
 https://github.com/user-attachments/assets/01f20678-64fb-4ae0-a9db-c8a15fc09e70
+
 https://github.com/user-attachments/assets/d1d7b687-ae00-44eb-8ed7-02b426b32231
+
 https://github.com/user-attachments/assets/0124aba0-f7a9-445b-bb33-6516c106abf1
+
 
 
 ## Features

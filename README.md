@@ -1,9 +1,13 @@
 # ComfyUI-FramePack-HY
 
+[English](README_EN.md) | 中文版
+
 这是一个为 ComfyUI 设计的自定义节点包，旨在通过分段采样（FramePack）的方式，利用 Hunyuan-DiT 类模型高效生成长视频。
 
 https://github.com/user-attachments/assets/01f20678-64fb-4ae0-a9db-c8a15fc09e70
+
 https://github.com/user-attachments/assets/d1d7b687-ae00-44eb-8ed7-02b426b32231
+
 https://github.com/user-attachments/assets/0124aba0-f7a9-445b-bb33-6516c106abf1
 
 
