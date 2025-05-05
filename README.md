@@ -2,11 +2,10 @@
 
 这是一个为 ComfyUI 设计的自定义节点包，旨在通过分段采样（FramePack）的方式，利用 Hunyuan-DiT 类模型高效生成长视频。
 
-<div>
-  <video controls width="30%" src="video/CY_00335.mp4"></video>
-  <video controls width="30%" src="video/CY_00340.mp4"></video>
-  <video controls width="30%" src="video/CY_00341.mp4"></video>
-</div>
+https://github.com/user-attachments/assets/01f20678-64fb-4ae0-a9db-c8a15fc09e70
+https://github.com/user-attachments/assets/d1d7b687-ae00-44eb-8ed7-02b426b32231
+https://github.com/user-attachments/assets/0124aba0-f7a9-445b-bb33-6516c106abf1
+
 
 ## 功能特性
 
@@ -14,6 +13,8 @@
 *   **起始帧定义:** 提供专门的节点来设置视频的起始关键帧，确保视频生成的起点符合预期。
 *   **内存优化:** 集成了内存管理策略，在模型加载和采样过程中尝试优化显存占用。
 *   **基于 Hunyuan-DiT:** 主要适配腾讯混元 DiT 架构的视频模型。
+
+![alt text](workflow/framepack-单图.png)
 
 ## 包含节点
 
