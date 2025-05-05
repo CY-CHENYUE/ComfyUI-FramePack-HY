@@ -7,7 +7,6 @@ import comfy.model_management as mm
 
 # 从diffusers_helper导入相关函数和类
 from ..diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
-from ..diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from ..diffusers_helper.memory import DynamicSwapInstaller
 
 SUPPORTED_PRECISIONS = ["auto", "fp16", "bf16", "fp32"]
@@ -17,7 +16,7 @@ class LoadFramePackDiffusersPipeline:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_path": ("STRING", {"default": "lllyasviel/FramePackI2V_HY"}),
+                "model_path": ("STRING", {"default": "lllyasviel/FramePackI2V_HY"}), # 保留此输入，允许用户指定模型名称或路径
                 "precision": (SUPPORTED_PRECISIONS, {"default": "bf16"}),
             }
         }
@@ -28,7 +27,7 @@ class LoadFramePackDiffusersPipeline:
     CATEGORY = "FramePack"
 
     def load_pipeline(self, model_path, precision):
-        print(f"[FramePack Loader] 加载模型，输入路径: '{model_path}'")
+        print(f"[FramePack Loader] 尝试加载模型: '{model_path}'") # 保留初始加载信息
 
         # 确定 torch_dtype
         dtype_map = {
@@ -38,148 +37,105 @@ class LoadFramePackDiffusersPipeline:
             "auto": torch.bfloat16  # 默认使用bf16
         }
         torch_dtype = dtype_map.get(precision)
-        
-        # 自动检测模型精度
-        if precision == "auto" and "bf16" in model_path.lower():
-            print("[FramePack Loader] 自动检测到bf16模型，设置dtype为bfloat16")
-            torch_dtype = torch.bfloat16
-        elif precision == "auto" and "fp16" in model_path.lower():
-            print("[FramePack Loader] 自动检测到fp16模型，设置dtype为float16")
-            torch_dtype = torch.float16
 
-        # 模型路径查找
-        model_found = False
-        base_models_dir = getattr(folder_paths, 'models_dir', None)
-        
-        # 1. 直接检查绝对路径
-        if os.path.isdir(model_path):
-            model_found = True
-            
-        # 2. 尝试get_folder_paths方法
-        if not model_found:
+        # 自动检测模型精度 (基于文件名或路径，如果未明确指定)
+        if precision == "auto":
+            if "bf16" in model_path.lower():
+                print("[FramePack Loader] 自动检测到bf16模型（基于路径名），设置dtype为bfloat16")
+                torch_dtype = torch.bfloat16
+            elif "fp16" in model_path.lower():
+                print("[FramePack Loader] 自动检测到fp16模型（基于路径名），设置dtype为float16")
+                torch_dtype = torch.float16
+            else:
+                 print("[FramePack Loader] 无法从路径名自动检测精度，使用默认值 bfloat16")
+                 torch_dtype = torch.bfloat16
+
+        # 模型路径查找逻辑
+        resolved_model_path = None
+
+        # 1. 检查输入是否为绝对路径
+        if os.path.isabs(model_path) and os.path.isdir(model_path):
+            # print(f"[FramePack Loader] 输入为绝对路径，直接使用: {model_path}") # 移除过程信息
+            resolved_model_path = model_path
+        else:
+            # 2. 遍历 ComfyUI 配置的 diffusers 基础目录
             try:
-                if hasattr(folder_paths, 'get_folder_paths'):
-                    diffusers_folders = folder_paths.get_folder_paths("diffusers")
-                    
-                    # 在所有diffusers文件夹中查找
-                    for folder in diffusers_folders:
-                        full_path = os.path.join(folder, model_path)
-                        if os.path.isdir(full_path):
-                            model_path = full_path
-                            model_found = True
-                            break
-            except Exception as e:
-                print(f"[FramePack Loader] 使用get_folder_paths查找出错: {e}")
-        
-        # 3. 检查标准的ComfyUI路径格式
-        if not model_found and base_models_dir:
-            # 处理形如 "lllyasviel/FramePackI2V_HY" 的路径
-            standard_path = os.path.join(base_models_dir, "diffusers", model_path)
-            if os.path.isdir(standard_path):
-                model_path = standard_path
-                model_found = True
-                
-            # 如果是斜杠分隔的路径，尝试按层级构建
-            elif "/" in model_path:
-                parts = model_path.split("/")
-                constructed_path = os.path.join(base_models_dir, "diffusers", *parts)
-                if os.path.isdir(constructed_path):
-                    model_path = constructed_path
-                    model_found = True
-                    
-                # 仅使用最后一部分
+                base_models_dirs = folder_paths.get_folder_paths("diffusers")
+                if not base_models_dirs:
+                     print("[FramePack Loader] 警告: 未找到配置的 ComfyUI diffusers 基础目录。") # 保留警告
                 else:
-                    last_part = parts[-1]
-                    simple_path = os.path.join(base_models_dir, "diffusers", last_part)
-                    if os.path.isdir(simple_path):
-                        model_path = simple_path
-                        model_found = True
-        
-        # 4. 尝试手动构建一些常见路径
-        if not model_found and base_models_dir:
-            common_paths = [
-                os.path.join(base_models_dir, "diffusers", model_path),
-                os.path.join(base_models_dir, model_path),
-            ]
-            
-            if "/" in model_path:
-                parts = model_path.split("/")
-                if len(parts) > 1:
-                    model_name = parts[-1]
-                    org_name = parts[0]
-                    common_paths.extend([
-                        os.path.join(base_models_dir, "diffusers", org_name, model_name),
-                        os.path.join(base_models_dir, "diffusers", model_name),
-                    ])
-            
-            for path in common_paths:
-                if os.path.isdir(path):
-                    model_path = path
-                    model_found = True
-                    break
-            
-            # 在当前目录下查找
-            if not model_found:
-                cwd = os.getcwd()
-                for root, dirs, files in os.walk(os.path.join(cwd, "models")):
-                    if os.path.basename(root) == "FramePackI2V_HY":
-                        model_path = root
-                        model_found = True
-                        break
-        
+                    # print(f"[FramePack Loader] 开始在以下基础目录中查找 '{model_path}': {base_models_dirs}") # 移除过程信息
+                    for base_dir in base_models_dirs:
+                        potential_path = os.path.join(base_dir, model_path)
+                        # print(f"[FramePack Loader] 正在检查路径: {potential_path}") # 移除过程信息
+                        if os.path.isdir(potential_path):
+                            # print(f"[FramePack Loader] 在 ComfyUI diffusers 目录中找到模型: {potential_path}") # 移除过程信息
+                            resolved_model_path = potential_path
+                            break # 找到后即停止搜索
+
+            except Exception as e:
+                print(f"[FramePack Loader] 遍历基础目录查找模型时出错: {e}") # 保留错误信息
+
+            # 3. 如果上述方法都未找到，最后检查一下输入本身是否是一个有效的相对路径（可能性较低）
+            if not resolved_model_path and os.path.isdir(model_path):
+                 # print(f"[FramePack Loader] 尝试将输入 '{model_path}' 作为相对路径使用。") # 移除过程信息
+                 resolved_model_path = model_path
+
         # 检查最终的模型路径是否有效
-        if not os.path.isdir(model_path):
+        if resolved_model_path is None or not os.path.isdir(resolved_model_path):
+            base_models_dir_list = folder_paths.get_folder_paths("diffusers") # 获取用于错误信息
             error_msg = (
-                f"无法找到模型目录: {model_path}\n"
-                f"调试信息:\n"
-                f"- ComfyUI模型目录: {base_models_dir if base_models_dir else '未知'}\n"
-                f"- 当前工作目录: {os.getcwd()}\n"
-                f"请确保您已下载模型并放在以下位置:\n"
-                f"ComfyUI/models/diffusers/{model_path}\n"
-                f"或使用绝对路径直接指定模型位置。"
+                f"无法找到模型目录: '{model_path}'\n"
+                f"尝试解析路径: {resolved_model_path or '无有效解析路径'}\n"
+                f"请确保您已下载模型并将其放置在以下 ComfyUI 的 diffusers 目录之一中，且路径与输入 '{model_path}' 匹配:\n"
+                + "\n".join([f"- {d}" for d in base_models_dir_list]) + "\n"
+                f"或者直接在输入框中使用模型的绝对路径。\n"
+                f"例如，对于 '{model_path}', 应该存在类似 '{os.path.join(base_models_dir_list[0] if base_models_dir_list else 'ComfyUI/models/diffusers', model_path)}' 的目录"
             )
-            raise FileNotFoundError(error_msg)
+            raise FileNotFoundError(error_msg) # 错误信息会终止执行，无需额外打印
+
+        # 更新 model_path 为解析后的绝对路径
+        model_path = resolved_model_path
+        print(f"[FramePack Loader] 成功定位模型路径: {model_path}") # 保留最终使用的路径信息
 
         # 检查目录内容是否符合预期
         try:
             dir_contents = os.listdir(model_path)
-            # 检查是否包含必要的模型文件
-            expected_files = ["config.json", "model.safetensors"]
-            for file in expected_files:
-                if not any(f == file or f.endswith(file) for f in dir_contents):
-                    print(f"[FramePack Loader] 警告: 未找到预期的模型文件 {file}")
+            expected_file = "config.json"
+            if expected_file not in dir_contents:
+                 print(f"[FramePack Loader] 警告: 模型目录 {model_path} 中缺少关键文件: {expected_file}") # 保留警告
         except Exception as e:
-            print(f"[FramePack Loader] 读取目录内容出错: {e}")
+            print(f"[FramePack Loader] 读取目录内容出错: {e}") # 保留错误信息
 
         # 加载模型
         try:
-            print(f"[FramePack Loader] 开始加载模型...")
-            
+            print(f"[FramePack Loader] 开始加载模型...") # 保留加载开始信息
+
             device = mm.get_torch_device()
             offload_device = mm.unet_offload_device()
-            
-            # 加载模型
+
             transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
-                model_path, 
-                torch_dtype=torch_dtype, 
+                model_path,
+                torch_dtype=torch_dtype,
                 attention_mode="sdpa"
             ).cpu()
-            
-            # 安装动态交换
-            DynamicSwapInstaller.install_model(transformer, device=device)
-            
-            # 创建pipeline结构
+
+            if not hasattr(transformer, '_dynamic_swap_installed'):
+                 DynamicSwapInstaller.install_model(transformer, device=device)
+                 transformer._dynamic_swap_installed = True
+            # else:
+                 # print("[FramePack Loader] DynamicSwap 已安装，跳过。") # 移除过程信息
+
             pipe = {
                 "transformer": transformer.eval(),
                 "dtype": torch_dtype,
             }
-                
-            print("[FramePack Loader] 模型加载成功")
-        except Exception as e:
-            print(f"[FramePack Loader] 加载模型错误: {e}")
-            raise RuntimeError(f"从 {model_path} 加载FramePack模型失败: {e}")
 
-        # 返回模型
+            print("[FramePack Loader] 模型加载成功") # 保留加载成功信息
+        except Exception as e:
+            print(f"[FramePack Loader] 加载模型错误: {e}") # 保留错误信息
+            raise RuntimeError(f"从 {model_path} (dtype: {torch_dtype}) 加载FramePack模型失败: {e}") # 错误信息会终止执行
+
         return (pipe,)
 
 NODE_CLASS_MAPPINGS = {

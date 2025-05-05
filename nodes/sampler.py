@@ -84,14 +84,7 @@ class FramePackDiffusersSampler:
             },
             "optional": {
                 "window_size": ("window_size", {"default": None, 
-                                       "tooltip": "从CreateKeyframes节点获取的窗口大小，优先级最高"}),
-                "target_latent_out": ("LATENT", {"tooltip": "(可选) 来自Keyframe节点的目标潜变量"}),
-                "target_index_out": ("target_index_out", {"tooltip": "(可选) 目标潜变量生效的分段索引"}), 
-                # 关键帧相关参数
-                "keyframe_guidance_strength": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 10.0, "step": 0.1, 
-                                                         "tooltip": "关键帧引导强度。控制关键帧对视频的影响程度。值越高，视频在关键帧位置越接近目标图像，过渡效果越明显"}),
-                "transition_window": ("transition_window", {"default": 0, 
-                                        "tooltip": "从CreateKeyframes节点获取的过渡窗口大小，控制过渡的平滑度"})
+                                       "tooltip": "(可选) 采样上下文窗口大小。若未连接，则使用默认值。控制模型生成时考虑的历史信息长度。"}),
            }
         }
 
@@ -100,68 +93,67 @@ class FramePackDiffusersSampler:
     CATEGORY = "FramePack"
 
     def sample(self, fp_pipeline, positive, negative, steps, cfg, guidance_scale, seed,
-               width, height, gpu_memory_preservation, sampler, 
+               width, height, gpu_memory_preservation, sampler,
                total_second_length=5, fps=24, latent_window_size=9,
                video_length_seconds=None, video_fps=None, window_size=None,
-               clip_vision=None, shift=0.0, use_teacache=True, 
-               teacache_thresh=0.15, denoise_strength=1.0, 
-               start_latent_out=None, target_latent_out=None, target_index_out=-1,
-               keyframe_guidance_strength=1.5, transition_window=0):
+               clip_vision=None, shift=0.0, use_teacache=True,
+               teacache_thresh=0.15, denoise_strength=1.0,
+               start_latent_out=None): # 移除了 target_latent_out, target_index_out, keyframe_guidance_strength, transition_window
 
         # 优先使用从CreateKeyframes节点连接的视频参数
         if video_length_seconds is not None:
             total_second_length = video_length_seconds
             print(f"[FramePack Sampler] 使用从CreateKeyframes节点获取的视频时长: {total_second_length}秒")
-            
+
         if video_fps is not None:
             fps = video_fps
             print(f"[FramePack Sampler] 使用从CreateKeyframes节点获取的帧率: {fps}fps")
-            
+
         if window_size is not None:
             latent_window_size = window_size
             print(f"[FramePack Sampler] 使用从CreateKeyframes节点获取的窗口大小: {latent_window_size}")
-        
+
         print(f"[FramePack Sampler] 最终视频参数: 总时长={total_second_length}秒, 帧率={fps}fps, 窗口大小={latent_window_size}")
-        
+
         # 确保尺寸足够大
         if height < 256 or width < 256:
             raise ValueError(f"输入尺寸太小: {width}x{height}，请确保宽度和高度至少为256像素")
-        
+
         # 确保我们有一个加载好的transformer
         if "transformer" not in fp_pipeline or "dtype" not in fp_pipeline:
             raise ValueError("无效的Pipeline对象。请使用Load FramePack Pipeline节点加载有效的模型。")
-        
+
         transformer = fp_pipeline["transformer"]
         dtype = fp_pipeline["dtype"]
-        
+
         # 设备和数据类型准备
         device = model_management.get_torch_device()
         offload_device = model_management.unet_offload_device()
         print(f"[FramePack Sampler] 使用设备: {device}, 精度: {dtype}")
-        
+
         # 计算潜变量尺寸
         latent_height = height // 8
         latent_width = width // 8
-        
+
         # 计算视频帧数和分段
         num_frames_per_window = latent_window_size * 4 - 3
         total_latent_sections = (total_second_length * fps) / num_frames_per_window
         total_latent_sections = math.ceil(total_latent_sections)
         total_latent_sections = max(1, int(total_latent_sections))
         print(f"[FramePack Sampler] 总分段数: {total_latent_sections}, 每段帧数: {num_frames_per_window}")
-        
+
         # 内存管理
         model_management.unload_all_models()
         model_management.cleanup_models()
         model_management.soft_empty_cache()
-        
+
         # 处理条件输入
         print("[FramePack Sampler] 处理条件输入...")
-        
+
         # 处理正向条件
         llama_vec = positive[0][0].to(dtype=dtype, device=device)
         clip_l_pooler = positive[0][1]["pooled_output"].to(dtype=dtype, device=device)
-        
+
         # 处理负向条件
         if not math.isclose(cfg, 1.0):  # 如果需要真正的CFG
             llama_vec_n = negative[0][0].to(dtype=dtype, device=device)
@@ -170,21 +162,21 @@ class FramePackDiffusersSampler:
             # 如果CFG为1.0，创建全零条件
             llama_vec_n = torch.zeros_like(llama_vec, device=device)
             clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
-        
+
         # 裁剪或填充LLAMA嵌入和创建注意力掩码
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-        
+
         # 准备CLIP视觉特征
         image_embeddings = None
         if clip_vision is not None:
             image_embeddings = clip_vision["last_hidden_state"].to(dtype=dtype, device=device)
             print(f"[FramePack Sampler] CLIP视觉特征形状: {image_embeddings.shape}")
-        
+
         # 移除了 start_latent 的处理
         batch_size = 1
         initial_latent = None # 当前逻辑不使用I2V的 initial_latent
-        
+
         # 初始化历史潜变量 - 修改：初始化为空，将在循环中构建
         history_latents = torch.zeros(
             (batch_size, 16, 0, latent_height, latent_width), # 时间维度从0开始
@@ -192,28 +184,28 @@ class FramePackDiffusersSampler:
             device="cpu" # 存储在CPU以节省显存
         )
         total_generated_latent_frames = 0 # 追踪已生成的帧数
-        
+
         # 准备随机生成器
         generator = torch.Generator("cpu").manual_seed(seed)
-        
+
         # 创建ComfyUI模型封装
         comfy_model = HyVideoModel(
             HyVideoModelConfig(dtype),
             model_type=comfy.model_base.ModelType.FLOW,
             device=device,
         )
-        
+
         # 创建模型patcher
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
-        
+
         # 创建进度条回调函数 - 修改为更准确地反映多分段进度
         # 计算总步数为 steps * total_latent_sections
         total_steps = steps * total_latent_sections
         progress_bar = comfy.utils.ProgressBar(total_steps)
-        
+
         # 记录当前分段索引和已完成的分段数
         current_section_index = 0
-        
+
         # 定义一个适配k_diffusion库调用格式的回调函数
         def callback_adapter(d):
             # k_diffusion的callback传入参数是一个字典: {'x': x, 'i': i, 'denoised': model_prev_list[-1]}
@@ -221,28 +213,28 @@ class FramePackDiffusersSampler:
                 step = d['i']
                 # 只更新一步，因为总步数已经是考虑了所有分段的
                 progress_bar.update(1)
-                
+
                 # 打印更详细的进度信息
                 if step % 5 == 0 or step == steps - 1:  # 每5步或最后一步打印一次
                     section_progress = f"{current_section_index + 1}/{total_latent_sections}"
                     overall_progress = f"{(current_section_index * steps + step + 1)}/{total_steps}"
                     print(f"[FramePack Sampler] 进度: 分段 {section_progress}, 步骤 {step + 1}/{steps}, 总进度 {overall_progress}")
             return None
-            
+
         # ---------- 改进的模型加载与内存管理 ----------
         print(f"[FramePack Sampler] 开始加载模型到GPU设备，内存保留量设置为 {gpu_memory_preservation} GB")
-        
+
         # 检查可用内存并估算模型大小
         try:
             current_free_memory = get_cuda_free_memory_gb(device)
             print(f"[FramePack Sampler] 当前GPU可用内存: {current_free_memory:.2f} GB")
-            
+
             # 如果内存保留值大于当前可用内存的80%，发出警告并调整
             if gpu_memory_preservation > current_free_memory * 0.8:
                 adjusted_preservation = current_free_memory * 0.5  # 调整为可用内存的50%
                 print(f"[FramePack Sampler] 警告: 内存保留值({gpu_memory_preservation}GB)过大, 自动调整为 {adjusted_preservation:.2f}GB")
                 gpu_memory_preservation = adjusted_preservation
-            
+
             # 在加载前先检查是否有足够内存
             if current_free_memory <= gpu_memory_preservation + 1.0:  # 需要至少保留值+1GB
                 print(f"[FramePack Sampler] 警告: GPU内存不足! 可用: {current_free_memory:.2f}GB, 需要: >{gpu_memory_preservation+1.0}GB")
@@ -250,52 +242,47 @@ class FramePackDiffusersSampler:
         except Exception as e:
             print(f"[FramePack Sampler] 内存检查过程出错: {e}")
             print("[FramePack Sampler] 继续执行，但可能不稳定")
-        
+
         # 改进的模型加载方法
         try:
             # 分阶段加载模型，每阶段检查内存
             print(f"[FramePack Sampler] 阶段1: 将模型移动至 {device}...")
             move_model_to_device_with_memory_preservation(
-                transformer, 
-                target_device=device, 
+                transformer,
+                target_device=device,
                 preserved_memory_gb=gpu_memory_preservation
             )
-            
+
             # 检查加载后的内存状态
             try:
                 post_load_memory = get_cuda_free_memory_gb(device)
                 print(f"[FramePack Sampler] 模型加载后GPU可用内存: {post_load_memory:.2f} GB")
-                
+
                 if post_load_memory < gpu_memory_preservation:
                     print(f"[FramePack Sampler] 注意: 加载后可用内存({post_load_memory:.2f}GB)低于保留目标({gpu_memory_preservation}GB)")
                     print(f"[FramePack Sampler] 将尝试继续运行，但可能会出现内存不足错误")
             except Exception as e:
                 print(f"[FramePack Sampler] 加载后内存检查出错: {e}")
-        
+
         except Exception as e:
             print(f"[FramePack Sampler] 模型加载失败: {e}")
             print(f"[FramePack Sampler] 尝试使用备用加载方法...")
-            
+
             # 备用加载方法 - 直接加载但不管理内存
             transformer.to(device)
             print("[FramePack Sampler] 使用备用方法加载模型完成")
-        
+
         # 运行采样
         print("[FramePack Sampler] 开始采样...")
         print(f"  - 尺寸: {width}x{height}, 总帧数: {total_second_length * fps}")
         print(f"  - 分段数: {total_latent_sections}, 每段窗口大小: {latent_window_size}")
         print(f"  - 步数: {steps}, CFG: {cfg}, Guidance Scale: {guidance_scale}")
         print(f"  - 种子: {seed}, 移位: {shift}")
-        
+
         try:
-            # --- 修改: 处理新的 Start-Target 输入 --- 
+            # --- 修改: 移除 target 相关处理 ---
             visual_start_latent = None
-            visual_target_latent = None
-            target_start_index = target_index_out # 直接使用传入的索引
-            # === 添加调试打印 ===
-            print(f"[FramePack Sampler DEBUG] Received target_index_out: {target_index_out}, Initial target_start_index: {target_start_index}")
-            # ==================
-            
+          
             if start_latent_out is not None and "samples" in start_latent_out:
                 # 起始潜变量是必需的，应用VAE缩放因子
                 vs_latent = start_latent_out["samples"]
@@ -307,43 +294,6 @@ class FramePackDiffusersSampler:
                     raise ValueError("输入的起始潜变量无效或为空！")
             else:
                  raise ValueError("未提供有效的起始潜变量 (start_latent_out)！")
-
-            # 处理可选的目标潜变量
-            if target_latent_out is not None and "samples" in target_latent_out and target_start_index >= 0:
-                vt_latent = target_latent_out["samples"]
-                if vt_latent is not None and vt_latent.shape[2] > 0: # 检查时间维度是否有效
-                     visual_target_latent = vt_latent * vae_scaling_factor
-                     visual_target_latent = visual_target_latent.to(dtype=dtype, device="cpu") # 准备在CPU上
-                     print(f"[关键帧逻辑] 已准备目标潜变量 (来自target_latent_out)，目标索引: {target_start_index}，形状: {visual_target_latent.shape}")
-                     # 确保目标索引在范围内
-                     if target_start_index >= total_latent_sections:
-                         print(f"[关键帧逻辑] 警告: 目标索引 {target_start_index} 超出总分段数 {total_latent_sections}，将调整为最后一个分段 {total_latent_sections - 1}")
-                         target_start_index = total_latent_sections - 1
-                     # 确保目标索引不为0
-                     if target_start_index == 0:
-                         print(f"[关键帧逻辑] 警告: 目标索引不能为0，已禁用目标引导。")
-                         target_start_index = -1 # 禁用目标
-                         visual_target_latent = None
-                else:
-                    print(f"[关键帧逻辑] 提供的目标潜变量为空或无效，已禁用目标引导。")
-                    target_start_index = -1 # 禁用目标
-                    visual_target_latent = None
-            else:
-                print(f"[关键帧逻辑] 未提供有效的目标潜变量或目标索引，禁用目标引导。")
-                target_start_index = -1 # 禁用目标
-                visual_target_latent = None
-            # ------------------------------------------
-
-            # 重置旧的变量，以防意外使用
-            visual_end_latent = None 
-            idx_visual_end = -1
-            idx_visual_start = 0 # 起点固定为0
-            
-            # 在循环开始前准备好关键帧潜变量 - 修改：逻辑已移到上面处理输入的部分
-            # if keyframes is not None and len(keyframe_idx_list) >= 1:
-            #     ...
-            # else:
-            #     ...
 
             # --- 修改: 从前向后逐段生成 ---
             for current_section_index in range(total_latent_sections):
@@ -360,90 +310,14 @@ class FramePackDiffusersSampler:
                 # 用于 sample_hunyuan 的 clean_latents 参数的索引
                 clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
 
-                # --- 修改: 关键帧处理逻辑 (计算 target_latent 和 weight) ---
-                # 使用 forward_section_no 表达更清晰，即 current_section_index
-                forward_section_no = current_section_index
+                # --- 移除复杂的关键帧处理逻辑 ---
+                # forward_section_no = current_section_index
+                # ... (移除 target_latent, calculated_weight, transition_progress 计算) ...
+                # 使用固定的起始潜变量作为引导
+                start_latent_guidance = visual_start_latent.to(device=device, dtype=dtype)
+                print(f"[关键帧逻辑] 处理分段 {current_section_index + 1}，使用起始潜变量引导")
 
-                # 初始化默认目标 (零潜变量) 和权重
-                # 需要创建一个形状正确的零张量作为默认目标
-                # 修改：使用 visual_start_latent (它现在是必需的) 的形状
-                # if visual_start_latent is not None: 
-                #     default_target_shape = visual_start_latent.shape
-                # else:
-                #     # 创建一个基于配置的形状 (B=1, C=16, T=1, H, W)
-                #     default_target_shape = (batch_size, 16, 1, latent_height, latent_width)
-                default_target_shape = visual_start_latent.shape # 直接使用start_latent的形状
-
-                # 确保在正确的设备和类型上创建
-                default_target_latent = torch.zeros(default_target_shape, dtype=dtype, device=device)
-
-                target_latent = default_target_latent # 默认为零
-                calculated_weight = 1.0 # 默认权重
-
-                # --- 关键帧引导逻辑 (与之前类似，基于 forward_section_no) ---
-                # --- 修改：实现新的 Start -> Target 引导逻辑 ---
-                print(f"[关键帧逻辑] 处理分段 {forward_section_no}/{total_latent_sections - 1} (Start-Target模式)")
-
-                # --- 修改：实现渐进式过渡 --- 
-                if visual_target_latent is not None and target_start_index > 0:
-                    # 计算距离目标索引的距离
-                    distance_to_target = target_start_index - forward_section_no
-                    
-                    # 设置过渡区间
-                    # 优先使用从 CreateKeyframes 节点传入的过渡窗口大小
-                    if transition_window > 0:
-                        transition_window_size = min(transition_window, target_start_index)
-                        print(f"[关键帧逻辑] 使用从CreateKeyframes节点传入的过渡窗口大小: {transition_window_size}")
-                    else:
-                        # 否则自动计算：在目标索引前几个分段开始过渡
-                        transition_window_size = min(5, target_start_index // 2)  # 过渡窗口，至少1个分段，最多5个分段
-                        transition_window_size = max(1, transition_window_size)  # 确保至少有1个分段的过渡
-                        print(f"[关键帧逻辑] 自动计算过渡窗口大小: {transition_window_size}")
-                    
-                    if forward_section_no >= target_start_index:
-                        # 已达到或超过目标位置，完全引导至目标
-                        target_latent = visual_target_latent.to(device=device, dtype=dtype)
-                        calculated_weight = keyframe_guidance_strength
-                        transition_progress = 1.0  # 完全过渡到目标
-                        print(f"  -> 分段已达到/超过目标索引({target_start_index})，完全引导至目标，权重: {calculated_weight:.2f}")
-                    
-                    elif distance_to_target <= transition_window_size:
-                        # 在过渡窗口内，计算过渡进度 (从0到1)
-                        transition_progress = 1.0 - (distance_to_target / transition_window_size)
-                        
-                        # 根据过渡进度混合起点和目标潜变量
-                        start_weight = (1.0 - transition_progress) * keyframe_guidance_strength
-                        target_weight = transition_progress * keyframe_guidance_strength
-                        
-                        # 计算混合潜变量
-                        if visual_start_latent.shape == visual_target_latent.shape:
-                            # 直接在潜空间混合
-                            target_latent = ((1.0 - transition_progress) * visual_start_latent + 
-                                             transition_progress * visual_target_latent).to(device=device, dtype=dtype)
-                            calculated_weight = keyframe_guidance_strength  # 保持总体权重不变
-                            print(f"  -> 在过渡窗口内 ({distance_to_target}/{transition_window_size})，混合引导，"
-                                  f"进度: {transition_progress:.2f}，权重: {calculated_weight:.2f}")
-                        else:
-                            # 形状不匹配时，仍使用起点但降低权重，为过渡做准备
-                            target_latent = visual_start_latent.to(device=device, dtype=dtype)
-                            # 随着接近目标，逐渐降低起点权重
-                            calculated_weight = start_weight
-                            print(f"  -> 在过渡窗口内 ({distance_to_target}/{transition_window_size})，"
-                                  f"降低起点权重至 {calculated_weight:.2f}，为过渡做准备")
-                    else:
-                        # 在过渡窗口外，仍然引导至起点
-                        target_latent = visual_start_latent.to(device=device, dtype=dtype)
-                        calculated_weight = keyframe_guidance_strength
-                        transition_progress = 0.0  # 尚未开始过渡
-                        print(f"  -> 距离目标尚远 ({distance_to_target} > {transition_window_size})，引导至起点，权重: {calculated_weight:.2f}")
-                else:
-                    # 无目标或目标索引无效时，引导至起点
-                    target_latent = visual_start_latent.to(device=device, dtype=dtype)
-                    calculated_weight = keyframe_guidance_strength
-                    transition_progress = 0.0  # 无过渡
-                    print(f"  -> 引导至起点，权重: {calculated_weight:.2f}")
-                
-                # --- 修改: 准备 clean_latents (参照参考代码) --- 
+                # --- 修改: 准备 clean_latents (参照参考代码) ---
                 # 需要从 history_latents 末尾提取历史信息
                 # 处理 history_latents 不足的情况 (特别是第一帧)
 
@@ -488,56 +362,14 @@ class FramePackDiffusersSampler:
                     clean_latents_4x = torch.cat([zero_latent_4x[:, :, :(16 - len_4x), :, :], actual_4x], dim=2) if len_4x < 16 else actual_4x
 
                     print(f"  - 提取长度: 1x={clean_latents_1x.shape[2]}, 2x={clean_latents_2x.shape[2]}, 4x={clean_latents_4x.shape[2]}")
-                
-                # --- 修改：优化渐进式过渡的clean_latents构建 ---
-                # 存储过渡进度供后续使用
-                current_transition_progress = 0.0 if 'transition_progress' not in locals() else transition_progress
-                
-                # --- 修改：实现三阶段引导逻辑，但基于渐进式过渡 ---
-                is_guiding_target = visual_target_latent is not None and target_start_index > 0
-                
-                if is_guiding_target:
-                    if current_transition_progress > 0 and current_transition_progress < 1.0:
-                        # 过渡阶段：混合clean_latents
-                        # 历史帧的重要性随过渡进度增加
-                        history_weight = 0.5 + 0.3 * current_transition_progress
-                        # 确保形状匹配
-                        if clean_latents_1x.shape != target_latent.shape:
-                            print(f"[FramePack Sampler] 警告：混合引导时形状不匹配！使用默认策略")
-                            weighted_target = target_latent * calculated_weight
-                            clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
-                        else:
-                            # 混合策略：历史帧权重随过渡进度增加，以保持运动连贯性
-                            mixed_latent = (history_weight * clean_latents_1x + 
-                                            (1.0 - history_weight) * target_latent).to(device=device, dtype=dtype)
-                            weighted_target = target_latent * calculated_weight
-                            clean_latents = torch.cat([weighted_target, mixed_latent], dim=2)
-                            print(f"[FramePack Sampler] 过渡阶段混合 (进度:{current_transition_progress:.2f}, 历史权重:{history_weight:.2f})")
-                    
-                    elif current_transition_progress >= 1.0:
-                        # 已完全过渡到目标：使用更偏向历史的混合，以保持连贯性
-                        # 在目标之后，更多依赖历史帧以保持连贯的运动
-                        history_weight = 0.85  # 高度依赖历史帧
-                        weighted_target = target_latent * calculated_weight
-                        if clean_latents_1x.shape != target_latent.shape:
-                            clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
-                        else:
-                            mixed_latent = (history_weight * clean_latents_1x + 
-                                           (1.0 - history_weight) * target_latent).to(device=device, dtype=dtype)
-                            clean_latents = torch.cat([weighted_target, mixed_latent], dim=2)
-                            print(f"[FramePack Sampler] 目标后阶段混合 (历史权重:{history_weight:.2f})")
-                    
-                    else:
-                        # 尚未开始过渡：正常使用起点和历史
-                        weighted_target = target_latent * calculated_weight
-                        clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
-                        print(f"[FramePack Sampler] 过渡前阶段，标准引导")
-                else:
-                    # 无目标情况，使用标准历史引导
-                    weighted_target = target_latent * calculated_weight
-                    clean_latents = torch.cat([weighted_target, clean_latents_1x], dim=2)
-                    print(f"[FramePack Sampler] 无目标，标准引导")
-                
+
+                # --- 简化 clean_latents 构建 ---
+                # 直接将起始潜变量引导和1x历史拼接
+                # 使用 start_latent_guidance (即处理过的 visual_start_latent)
+                clean_latents = torch.cat([start_latent_guidance, clean_latents_1x], dim=2)
+                print(f"[FramePack Sampler] 标准引导，使用起始潜变量和历史")
+                # 移除复杂的 if is_guiding_target: ... else: ... 结构
+
                 print(f"[FramePack Sampler] 准备好的 clean_latents 形状: {clean_latents.shape}")
                 print(f"  - clean_latents_1x 形状: {clean_latents_1x.shape}")
                 print(f"  - clean_latents_2x 形状: {clean_latents_2x.shape}")
@@ -549,7 +381,7 @@ class FramePackDiffusersSampler:
                         transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_thresh)
                     else:
                         transformer.initialize_teacache(enable_teacache=False)
-                
+
                 # 检查当前内存状态
                 try:
                     current_mem = get_cuda_free_memory_gb(device)
@@ -559,10 +391,10 @@ class FramePackDiffusersSampler:
                         torch.cuda.empty_cache()
                 except Exception as e:
                     print(f"[FramePack Sampler] 内存检查出错: {e}")
-                
+
                 # 执行采样
                 with torch.autocast(device_type=model_management.get_autocast_device(device), dtype=dtype, enabled=True):
-                    # 更新当前分段索引 (虽然循环变量就是它，但为了回调函数清晰)
+                    # 更新当前分段索引 (为了回调函数清晰)
                     # print(f"[FramePack Sampler] 开始处理分段 {current_section_index + 1}/{total_latent_sections}") # 日志位置调整
 
                     generated_latents = sample_hunyuan(
@@ -594,26 +426,26 @@ class FramePackDiffusersSampler:
                         # 添加额外参数 - 使用新的索引和clean_latents
                         image_embeddings=image_embeddings, # CLIP Vision 特征
                         latent_indices=latent_indices, # 当前窗口索引 [T]
-                        clean_latents=clean_latents, # [目标帧(加权), 1x历史] [B,C,1+1,H,W]
+                        clean_latents=clean_latents, # [起始帧, 1x历史] [B,C,1+1,H,W] - 简化
                         clean_latent_indices=clean_latent_indices, # 对应 clean_latents 的索引 [1+1]
                         clean_latents_2x=clean_latents_2x, # [2x历史] [B,C,2,H,W]
                         clean_latent_2x_indices=clean_latent_2x_indices, # [2]
                         clean_latents_4x=clean_latents_4x, # [4x历史] [B,C,16,H,W]
                         clean_latent_4x_indices=clean_latent_4x_indices, # [16]
                     )
-                
+
                 # 检查采样后的内存状态
                 try:
                     post_sample_mem = get_cuda_free_memory_gb(device)
                     print(f"[FramePack Sampler] 分段采样后GPU可用内存: {post_sample_mem:.2f} GB")
-                    
+
                     # 如果内存低于保留值的50%，清理缓存
                     if post_sample_mem < gpu_memory_preservation * 0.5:
                         print("[FramePack Sampler] 内存不足，清理缓存...")
                         torch.cuda.empty_cache()
                 except Exception as e:
                     print(f"[FramePack Sampler] 采样后内存检查出错: {e}")
-                
+
                 # --- 修改: 更新历史潜变量和总帧数 ---
                 # 将生成的潜变量移到CPU并拼接到 history_latents
                 current_generated_frames = generated_latents.shape[2]
@@ -623,22 +455,7 @@ class FramePackDiffusersSampler:
                 print(f"[FramePack Sampler] 更新后 history_latents 形状: {history_latents.shape}")
 
                 # 移除旧的反向逻辑和最后分段的特殊处理
-                # if is_last_section:
-                #     # 移除静态帧添加逻辑，防止视频开头出现静态画面
-                #     print("[FramePack Sampler] 处理最后分段 (时间上的第一段)")
-                #     # 不再额外添加静态帧，保持动态效果
-                #     print(f"[FramePack Sampler] 保持动态开始，形状: {generated_latents.shape}")
-
-                # 更新总帧数和历史潜变量 (已移到上面)
-                # total_generated_latent_frames += int(generated_latents.shape[2])
-                # history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
-
-                # 获取实际生成的潜变量 (已移到循环外)
-                # real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
-
-                # 如果是最后一段，停止生成 (现在由 for 循环控制)
-                # if is_last_section:
-                #     break
+                # ...
 
             # --- 修改: 循环结束后处理最终结果 ---
             print("[FramePack Sampler] 所有分段采样完成.")
@@ -675,7 +492,7 @@ class FramePackDiffusersSampler:
             print(error_message)
             print("[FramePack Sampler] 📋 错误详情:")
             traceback.print_exc()
-            
+
             # 更新进度条到错误状态
             try:
                 # 计算剩余步数并更新进度条
@@ -688,14 +505,14 @@ class FramePackDiffusersSampler:
                 print("[FramePack Sampler] ⚠️ 进度: 由于错误而中断!")
             except Exception as progress_error:
                 print(f"[FramePack Sampler] 更新进度条失败: {progress_error}")
-            
+
             # 提供通用的建议解决方案
             print("[FramePack Sampler] 🔧 建议解决方案:")
             print("1. 检查GPU内存是否足够，可能需要降低分辨率或减少生成的帧数")
             print("2. 确保模型正确加载")
             print("3. 检查条件输入是否有效")
             print("4. 如果问题持续，可以尝试重启ComfyUI或清理缓存")
-            
+
             # 创建一个空的有效潜变量作为返回值
             try:
                 print("[FramePack Sampler] 创建空潜变量作为错误恢复...")
@@ -719,14 +536,14 @@ class FramePackDiffusersSampler:
             # 主动释放内存
             print("[FramePack Sampler] 主动清理GPU内存...")
             torch.cuda.empty_cache()
-            
+
             # 释放transformer
             try:
                 print(f"[FramePack Sampler] 将transformer卸载到 {offload_device}")
                 transformer.to(offload_device)
             except Exception as e:
                 print(f"[FramePack Sampler] 卸载transformer时出错: {e}")
-            
+
             model_management.soft_empty_cache()
 
 
@@ -735,13 +552,13 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FramePackDiffusersSampler_HY": "FramePack Sampler (HY)"
-} 
+}
 
 # 导入辅助节点并添加到映射中
 try:
     from .keyframe_helper import NODE_CLASS_MAPPINGS as KEYFRAME_NODE_CLASS_MAPPINGS
     from .keyframe_helper import NODE_DISPLAY_NAME_MAPPINGS as KEYFRAME_NODE_DISPLAY_NAME_MAPPINGS
-    
+
     # 更新映射
     NODE_CLASS_MAPPINGS.update(KEYFRAME_NODE_CLASS_MAPPINGS)
     NODE_DISPLAY_NAME_MAPPINGS.update(KEYFRAME_NODE_DISPLAY_NAME_MAPPINGS)
